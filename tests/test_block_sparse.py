@@ -94,6 +94,37 @@ def test_pytree_and_to_preserve_mask() -> None:
     assert torch.equal(block_mask.to("cpu").to_dense(), block_mask.to_dense())
 
 
+def test_pad_to_capacity_preserves_mask_and_validates() -> None:
+    dense = _mask_patterns()["partial_edges"]
+    block_mask = BlockSparseMask.from_bool(dense)
+
+    padded = block_mask.pad_to_capacity(
+        schedule_width=block_mask.num_blocks,
+        partial_mask_count=block_mask.num_blocks**2,
+    )
+
+    padded.validate()
+    assert padded.partial_kv_indices.shape[-1] == block_mask.num_blocks
+    assert padded.full_q_indices.shape[-1] == block_mask.num_blocks
+    assert padded.partial_masks.shape[0] == block_mask.num_blocks**2
+    assert torch.equal(padded.to_dense(), dense[None, None])
+
+
+def test_pad_to_capacity_rejects_small_capacities() -> None:
+    block_mask = BlockSparseMask.from_bool(_mask_patterns()["partial_edges"])
+
+    with pytest.raises(ValueError, match="schedule_width"):
+        block_mask.pad_to_capacity(
+            schedule_width=0,
+            partial_mask_count=block_mask.num_blocks**2,
+        )
+    with pytest.raises(ValueError, match="partial_mask_count"):
+        block_mask.pad_to_capacity(
+            schedule_width=block_mask.num_blocks,
+            partial_mask_count=0,
+        )
+
+
 def test_construction_is_deterministic_and_schedules_are_transposes() -> None:
     dense = _mask_patterns()["partial_edges"]
     first = BlockSparseMask.from_bool(dense)

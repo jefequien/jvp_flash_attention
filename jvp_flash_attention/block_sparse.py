@@ -78,6 +78,20 @@ def _make_schedule(
     return counts, indices, mask_ids
 
 
+def _pad_last_dimension(value: Tensor, capacity: int) -> Tensor:
+    if value.shape[-1] == capacity:
+        return value
+    padding = value.new_zeros(*value.shape[:-1], capacity - value.shape[-1])
+    return torch.cat([value, padding], dim=-1)
+
+
+def _pad_first_dimension(value: Tensor, capacity: int) -> Tensor:
+    if value.shape[0] == capacity:
+        return value
+    padding = value.new_zeros(capacity - value.shape[0], *value.shape[1:])
+    return torch.cat([value, padding], dim=0)
+
+
 @dataclass(frozen=True, eq=False)
 class BlockSparseMask:
     """Precomputed 32x32 block-sparse Boolean attention mask.
@@ -284,6 +298,57 @@ class BlockSparseMask:
             for name in _TENSOR_FIELDS
         )
 
+    def pad_to_capacity(
+        self,
+        *,
+        schedule_width: int,
+        partial_mask_count: int,
+    ) -> BlockSparseMask:
+        """Pad inactive metadata slots to fixed capacities without changing the mask."""
+        schedule_width = int(schedule_width)
+        partial_mask_count = int(partial_mask_count)
+        schedule_tensors = (
+            self.partial_kv_indices,
+            self.partial_kv_mask_ids,
+            self.full_kv_indices,
+            self.partial_q_indices,
+            self.partial_q_mask_ids,
+            self.full_q_indices,
+        )
+        minimum_schedule_width = max(tensor.shape[-1] for tensor in schedule_tensors)
+        if schedule_width < minimum_schedule_width:
+            raise ValueError(
+                f"schedule_width must be at least {minimum_schedule_width}, "
+                f"got {schedule_width}."
+            )
+        if partial_mask_count < self.partial_masks.shape[0]:
+            raise ValueError(
+                f"partial_mask_count must be at least {self.partial_masks.shape[0]}, "
+                f"got {partial_mask_count}."
+            )
+        result = replace(
+            self,
+            partial_kv_indices=_pad_last_dimension(
+                self.partial_kv_indices, schedule_width
+            ),
+            partial_kv_mask_ids=_pad_last_dimension(
+                self.partial_kv_mask_ids, schedule_width
+            ),
+            full_kv_indices=_pad_last_dimension(self.full_kv_indices, schedule_width),
+            partial_q_indices=_pad_last_dimension(
+                self.partial_q_indices, schedule_width
+            ),
+            partial_q_mask_ids=_pad_last_dimension(
+                self.partial_q_mask_ids, schedule_width
+            ),
+            full_q_indices=_pad_last_dimension(self.full_q_indices, schedule_width),
+            partial_masks=_pad_first_dimension(
+                self.partial_masks, partial_mask_count
+            ),
+        )
+        result.validate()
+        return result
+
     @property
     def tile_density(self) -> float:
         """Return the fraction of full or partial tiles in the padded grid."""
@@ -436,16 +501,17 @@ class BlockSparseMask:
             expected_ids = set(range(len(forward_mask_ids)))
             if set(forward_mask_ids) != expected_ids:
                 raise ValueError("Partial mask IDs must form a compact range.")
-            if self.partial_masks.shape[0] != len(forward_mask_ids):
-                raise ValueError("Partial mask payloads must not be unused.")
             for mask_id in expected_ids:
                 payload = host["partial_masks"][mask_id]
                 if not bool(payload.any()) or bool(payload.all()):
                     raise ValueError(
                         "Each scheduled partial payload must be nonempty and not full."
                     )
-        elif self.partial_masks.shape[0] != 1 or bool(host["partial_masks"].any()):
-            raise ValueError("A mask without partial tiles requires one empty sentinel.")
+        if self.partial_masks.shape[0] < max(1, len(forward_mask_ids)):
+            raise ValueError("Partial mask storage does not cover every scheduled mask ID.")
+        inactive_payloads = host["partial_masks"][len(forward_mask_ids) :]
+        if bool(inactive_payloads.any()):
+            raise ValueError("Inactive partial mask payloads must be zero.")
 
         row_has_key = torch.zeros(
             (self.mask_batch_size, self.mask_heads, self.padded_length),
