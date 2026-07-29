@@ -23,15 +23,19 @@ Plus modifications to support Jacobian-vector products (JVPs) and Hessian-vector
 from __future__ import annotations
 
 import os
-from typing import Any, Literal, NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 import torch.autograd.forward_ad as fwAD
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
 from torch.autograd import Function
 from torch.autograd.function import FunctionCtx
+
+from .block_sparse import BlockSparseMask
+from .sparse_attention import sparse_attention_backward, sparse_attention_forward
 
 # NOTE: Uncomment to turn warnings into errors for debugging
 # import warnings
@@ -100,6 +104,74 @@ def _is_compiling() -> bool:
             return torch._dynamo.is_compiling()
         except Exception:
             return False
+
+
+def _dense_mask_strides(mask: Tensor) -> tuple[int, int, int, int]:
+    """Return Z/H/N/N strides, using zero for broadcast mask dimensions."""
+    if mask.ndim == 2:
+        return (0, 0, mask.stride(0), mask.stride(1))
+    if mask.ndim != 4:
+        raise ValueError(f"Expected a rank-2 or rank-4 attention mask, got {mask.ndim}.")
+    return (
+        0 if mask.shape[0] == 1 else mask.stride(0),
+        0 if mask.shape[1] == 1 else mask.stride(1),
+        mask.stride(2),
+        mask.stride(3),
+    )
+
+
+def _pad_sparse_inputs(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    block_mask: BlockSparseMask | None,
+) -> tuple[Tensor, Tensor, Tensor, int | None]:
+    """Validate square self-attention inputs and pad sparse inputs to 32-token tiles."""
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("Q/K/V must be rank-4 [batch, heads, sequence, head_dim].")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("JVP attention requires matching Q/K/V shapes.")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("JVP attention requires Q/K/V on the same device.")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise TypeError("JVP attention requires matching Q/K/V dtypes.")
+    if block_mask is None:
+        return q, k, v, None
+    if block_mask.block_size != MIN_SEQUENCE_LENGTH:
+        raise ValueError(
+            f"block_mask.block_size must be {MIN_SEQUENCE_LENGTH}, "
+            f"got {block_mask.block_size}."
+        )
+    expected_padded_length = (
+        (block_mask.original_length + MIN_SEQUENCE_LENGTH - 1)
+        // MIN_SEQUENCE_LENGTH
+        * MIN_SEQUENCE_LENGTH
+    )
+    if block_mask.padded_length != expected_padded_length:
+        raise ValueError(
+            "block_mask.padded_length must be the original length rounded up to "
+            f"{MIN_SEQUENCE_LENGTH}, got {block_mask.padded_length} for "
+            f"length {block_mask.original_length}."
+        )
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(
+            f"Block-sparse attention supports float16, bfloat16, and float32, got {q.dtype}."
+        )
+    if q.shape[2] != block_mask.original_length:
+        raise ValueError(
+            "Q/K/V sequence length must match block_mask.original_length, got "
+            f"{q.shape[2]} and {block_mask.original_length}."
+        )
+    if block_mask.device != q.device:
+        raise ValueError(
+            f"block_mask must be on the same device as Q/K/V, got {block_mask.device} "
+            f"and {q.device}."
+        )
+    pad_tokens = block_mask.padded_length - block_mask.original_length
+    if pad_tokens:
+        padding = (0, 0, 0, pad_tokens)
+        q, k, v = F.pad(q, padding), F.pad(k, padding), F.pad(v, padding)
+    return q, k, v, block_mask.original_length
 
 
 @triton.jit
@@ -2244,8 +2316,8 @@ def _attn_bwd(
     tl.store(dq_ptrs, dq)
 
 
-@torch.library.custom_op("jvp_flash_attention::attn_fwd_dual_triton", mutates_args=())
-def _attn_fwd_dual_triton(
+@torch.library.custom_op("jvp_flash_attention::attn_fwd_triton", mutates_args=())
+def _attn_fwd_triton(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -2259,32 +2331,9 @@ def _attn_fwd_dual_triton(
     causal: bool,
     warp_specialize: bool,
     mask_type: int,
+    enable_jvp: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Opaque custom op wrapper for the dual Triton forward launch used under torch.compile.
-    
-    Args:
-        q: Query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        k: Key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
-        v: Value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
-        q_t: Tangent query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        k_t: Tangent key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
-        v_t: Tangent value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
-        mask_tensor: Mask tensor for attention masking.
-        sm_scale: Scaling factor for the softmax.
-        dropout_p: Dropout probability.
-        philox_seed: Seed for Philox RNG used in dropout.
-        causal: Whether to apply causal masking.
-        warp_specialize: Whether to enable warp specialization in the Triton kernel.
-        mask_type: Type of masking (0: no mask, 1: boolean mask,
-                        2: additive mask).
-
-    Returns:
-        A tuple containing:
-        - Output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        - Tangent output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        - Memory tensor M of shape (Z, H, N_CTX) used for the backward pass.
-    """
+    """Opaque dense primal/JVP Triton launch used under ``torch.compile``."""
     Z, H, N_CTX, HEAD_DIM_Q = q.shape
     HEAD_DIM_K = k.shape[-1]
     HEAD_DIM_V = v.shape[-1]
@@ -2297,7 +2346,8 @@ def _attn_fwd_dual_triton(
     STAGE = 3 if causal else 1
     ENABLE_DROPOUT = dropout_p > 0.0
     o = torch.empty_like(q)
-    o_t = torch.empty_like(q_t)
+    o_t = torch.empty_like(q_t) if enable_jvp else torch.empty(0, device=q.device)
+    kernel_o_t = o_t if enable_jvp else o
     M = torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32)
 
     extra_kern_args = {}
@@ -2306,7 +2356,9 @@ def _attn_fwd_dual_triton(
         extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
     if is_cuda() and warp_specialize:
-        extra_kern_args["maxnreg"] = 168
+        extra_kern_args["maxnreg"] = (
+            168 if (HEAD_DIM_K == 128 and q.dtype == torch.float16) or enable_jvp else 80
+        )
 
     if hasattr(triton, "set_allocator") and is_cuda():
 
@@ -2321,12 +2373,7 @@ def _attn_fwd_dual_triton(
     if mask_type == 0:
         mask_strides = (0, 0, 0, 0)
     else:
-        mask_strides = (
-            mask_tensor.stride(0),
-            mask_tensor.stride(1),
-            mask_tensor.stride(2),
-            mask_tensor.stride(3),
-        )
+        mask_strides = _dense_mask_strides(mask_tensor)
 
     Z_H = Z * H
 
@@ -2343,7 +2390,7 @@ def _attn_fwd_dual_triton(
         sm_scale,
         M,
         o,
-        o_t,  #
+        kernel_o_t,  #
         mask_tensor,  #
         dropout_p,  #
         philox_seed,  #
@@ -2354,7 +2401,7 @@ def _attn_fwd_dual_triton(
         *strides_zhnd(k_t),  #
         *strides_zhnd(v_t),  #
         *strides_zhnd(o),  #
-        *strides_zhnd(o_t),  #
+        *strides_zhnd(kernel_o_t),  #
         *mask_strides,  #
         Z,
         H,  #
@@ -2363,7 +2410,7 @@ def _attn_fwd_dual_triton(
         FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
         STAGE=STAGE,  #
         warp_specialize=warp_specialize,  #
-        ENABLE_JVP=True,  #
+        ENABLE_JVP=enable_jvp,  #
         ENABLE_DROPOUT=ENABLE_DROPOUT,
         MASK_TYPE=mask_type,
         # NOTE: The following are safe (unit-tested) default values
@@ -2376,8 +2423,8 @@ def _attn_fwd_dual_triton(
     return o, o_t, M
 
 
-@_attn_fwd_dual_triton.register_fake
-def _attn_fwd_dual_triton_fake(
+@_attn_fwd_triton.register_fake
+def _attn_fwd_triton_fake(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -2391,78 +2438,196 @@ def _attn_fwd_dual_triton_fake(
     causal: bool,
     warp_specialize: bool,
     mask_type: int,
+    enable_jvp: bool,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """
-    Fake implementation of the dual Triton forward launch for compilation purposes.
-    This implementation does not perform any actual computation and returns
-    empty tensors with the appropriate shapes.
-
-    Args:
-        q: Query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        k: Key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
-        v: Value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
-        q_t: Tangent query tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        k_t: Tangent key tensor of shape (Z, H, N_CTX, HEAD_DIM_K).
-        v_t: Tangent value tensor of shape (Z, H, N_CTX, HEAD_DIM_V).
-        mask_tensor: Mask tensor for attention masking.
-        sm_scale: Scaling factor for the softmax.
-        dropout_p: Dropout probability.
-        philox_seed: Seed for Philox RNG used in dropout.
-        causal: Whether to apply causal masking.
-        warp_specialize: Whether to enable warp specialization in the Triton kernel.
-        mask_type: Type of masking (0: no mask, 1: boolean mask,
-                        2: additive mask).
-
-    Returns:
-        A tuple containing:
-        - An empty output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        - An empty tangent output tensor of shape (Z, H, N_CTX, HEAD_DIM_Q).
-        - An empty memory tensor M of shape (Z, H, N_CTX) used for the backward pass.
-    """
+    """Propagate dense custom-op output shapes for FakeTensor execution."""
     Z, H, N_CTX, _ = q.shape
     return (
         torch.empty_like(q),
-        torch.empty_like(q_t),
+        torch.empty_like(q_t) if enable_jvp else torch.empty(0, device=q.device),
         torch.empty((Z, H, N_CTX), device=q.device, dtype=torch.float32),
     )
+
+
+def _launch_dense_backward(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    M: Tensor,
+    do: Tensor,
+    mask_tensor: Tensor,
+    sm_scale: float,
+    causal: bool,
+    mask_type: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Launch the existing dense reverse kernels outside ``autograd.Function``."""
+    if not do.is_contiguous():
+        do = do.contiguous()
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    delta = torch.empty_like(M)
+    Z, H, N_CTX, head_dim = q.shape
+    block = MIN_SEQUENCE_LENGTH
+    if N_CTX % block:
+        raise ValueError(f"Dense backward requires sequence length divisible by {block}.")
+    scaled_k = k * (sm_scale * 1.4426950408889634)
+    mask_strides = (0, 0, 0, 0) if mask_type == 0 else _dense_mask_strides(mask_tensor)
+    grid = (N_CTX // block, Z * H)
+    _attn_bwd_preprocess[grid](
+        o,
+        do,
+        delta,
+        N_CTX,
+        BLOCK_M=block,
+        HEAD_DIM=head_dim,
+    )
+    bwd_kernel = _attn_bwd_causal if causal else _attn_bwd
+    num_stages = (
+        5 if is_cuda() and torch.cuda.get_device_capability()[0] == 9 else NUM_STAGES_OPTIONS[0]
+    )
+    bwd_kernel[grid](
+        q,
+        scaled_k,
+        v,
+        sm_scale,
+        do,
+        dq,
+        dk,
+        dv,
+        M,
+        delta,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        *mask_strides,
+        H,
+        N_CTX,
+        BLOCK_M1=block,
+        BLOCK_N1=block,
+        BLOCK_M2=block,
+        BLOCK_N2=block,
+        BLK_SLICE_FACTOR=2,
+        HEAD_DIM=head_dim,
+        mask_ptr=mask_tensor,
+        MASK_TYPE=mask_type,
+        dropout_p=0.0,
+        philox_seed=0,
+        ENABLE_DROPOUT=False,
+        num_stages=num_stages,
+        num_warps=4,
+    )
+    return dq, dk, dv
+
+
+@torch.library.custom_op("jvp_flash_attention::attn_bwd_dense_triton", mutates_args=())
+def _attn_bwd_dense_triton(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    M: Tensor,
+    do: Tensor,
+    mask_tensor: Tensor,
+    sm_scale: float,
+    causal: bool,
+    mask_type: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Opaque dense reverse launch for compiled autograd."""
+    return _launch_dense_backward(
+        q,
+        k,
+        v,
+        o,
+        M,
+        do,
+        mask_tensor,
+        sm_scale,
+        causal,
+        mask_type,
+    )
+
+
+@_attn_bwd_dense_triton.register_fake
+def _attn_bwd_dense_triton_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    M: Tensor,
+    do: Tensor,
+    mask_tensor: Tensor,
+    sm_scale: float,
+    causal: bool,
+    mask_type: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Propagate dense backward output shapes for FakeTensor execution."""
+    del o, M, do, mask_tensor, sm_scale, causal, mask_type
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _setup_dense_autograd(ctx, inputs, output) -> None:
+    """Save dense primal state needed by the custom-op backward."""
+    o, o_t, M = output
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(o_t, M)
+    ctx.save_for_backward(inputs[0], inputs[1], inputs[2], o, M, inputs[6])
+    ctx.sm_scale = inputs[7]
+    ctx.causal = inputs[10]
+    ctx.mask_type = inputs[12]
+
+
+def _backward_dense(ctx, grad_o, grad_o_t, _grad_M):
+    """Differentiate the dense custom op through its primal output."""
+    if grad_o_t is not None:
+        raise NotImplementedError(
+            "Reverse-mode differentiation through the JVP tangent is unsupported; "
+            "detach the tangent before including it in a loss."
+        )
+    if grad_o is None:
+        return (None,) * 14
+    q, k, v, o, M, mask_tensor = ctx.saved_tensors
+    dq, dk, dv = _attn_bwd_dense_triton(
+        q,
+        k,
+        v,
+        o,
+        M,
+        grad_o,
+        mask_tensor,
+        ctx.sm_scale,
+        ctx.causal,
+        ctx.mask_type,
+    )
+    return dq, dk, dv, *([None] * 11)
+
+
+_attn_fwd_triton.register_autograd(
+    _backward_dense,
+    setup_context=_setup_dense_autograd,
+)
 
 
 class JVPAttn(Function):
     """JVP (Jacobian-Vector Product) for Attention Mechanism."""
 
-    class Grid(NamedTuple):
-        """Grid configuration for JVP Attention."""
-
-        M_BLOCKS: int
-        Z_H: int
-        ONE: Literal[1]
-
     class FnCtx(FunctionCtx):
         """Function context for JVP Attention."""
 
         sm_scale: float
-        HEAD_DIM_K: int
         causal: bool
-        grid: JVPAttn.Grid
         mask_tensor: Tensor
         MASK_TYPE: int
-        dropout_p: float
-        philox_seed: int
-        ENABLE_DROPOUT: bool
+        block_mask: BlockSparseMask | None
 
     class FwdOutCtxContrib(NamedTuple):
         """Forward output context contributions for JVP Attention."""
 
         o_t: Tensor | None
         M: Tensor
-        grid: JVPAttn.Grid
-        HEAD_DIM_K: int
         sm_scale: float
         mask_tensor: Tensor
         MASK_TYPE: int
-        dropout_p: float
-        philox_seed: int
-        ENABLE_DROPOUT: bool
 
     class FwdOut(NamedTuple):
         """Forward output for JVP Attention."""
@@ -2492,14 +2657,7 @@ class JVPAttn(Function):
         warp_specialize: None
         USE_TMA: None
         verify_attn_mask: None
-
-    class Strides(NamedTuple):
-        """Strides for JVP Attention."""
-
-        z: int
-        h: int
-        n_ctx: int
-        head_dim: int
+        block_mask: None
 
     @staticmethod
     def forward(
@@ -2516,6 +2674,7 @@ class JVPAttn(Function):
         warp_specialize: bool = True,
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
+        block_mask: BlockSparseMask | None = None,
     ) -> JVPAttn.FwdOut:
         """Forward pass for JVP Attention.
 
@@ -2542,13 +2701,17 @@ class JVPAttn(Function):
             sm_scale: Optional scaling factor for softmax.
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
-            verify_attn_mask: Whether to verify the correctness of the provided attention mask.
+            verify_attn_mask: Whether to check attention-mask values during eager
+                execution. Shape, dtype, and device are always validated.
+            block_mask: Optional precomputed 32x32 block-sparse Boolean mask.
+                This is mutually exclusive with ``attn_mask`` and ``causal``.
 
         Returns:
             Outputs of JVP Attention.
         """
         if dropout_p != 0.0:
             raise NotImplementedError("Dropout is not currently supported in JVP attention.")
+        compiling = _is_compiling()
 
         # Collect metadata
         Z, H, N_CTX, HEAD_DIM_Q = q.shape
@@ -2571,23 +2734,69 @@ class JVPAttn(Function):
             f" but got N_CTX={N_CTX}",
         )
 
-        if causal and attn_mask is not None:
-            raise ValueError("Causal attention does not support an attention mask.")
-        if attn_mask is not None and verify_attn_mask:
-            assert attn_mask.shape == (
-                Z,
-                H,
-                N_CTX,
-                N_CTX,
-            ), "The provided attention mask must have 4 dimensions (Z, H, N_CTX, N_CTX)."
-            assert attn_mask.dtype in {
-                torch.bool,
-                q.dtype,
-            }, "The attention mask must be of the dtype bool or that of the query tensor."
+        if attn_mask is not None and block_mask is not None:
+            raise ValueError("attn_mask and block_mask are mutually exclusive.")
+        if causal and (attn_mask is not None or block_mask is not None):
+            raise ValueError("Causal attention does not support an explicit attention mask.")
+        if attn_mask is not None:
+            valid_shape = (attn_mask.ndim == 2 and attn_mask.shape == (N_CTX, N_CTX)) or (
+                attn_mask.ndim == 4
+                and attn_mask.shape[0] in (1, Z)
+                and attn_mask.shape[1] in (1, H)
+                and attn_mask.shape[2:] == (N_CTX, N_CTX)
+            )
+            if not valid_shape:
+                raise ValueError(
+                    "The attention mask must have shape [N_CTX, N_CTX] or "
+                    "[1|Z, 1|H, N_CTX, N_CTX]."
+                )
+            if attn_mask.dtype not in {torch.bool, q.dtype}:
+                raise TypeError(
+                    "The attention mask must be Boolean or have the query dtype, "
+                    f"got {attn_mask.dtype} and {q.dtype}."
+                )
+            if attn_mask.device != q.device:
+                raise ValueError(
+                    "The attention mask and Q/K/V must be on the same device, "
+                    f"got {attn_mask.device} and {q.device}."
+                )
+        if block_mask is not None:
+            if N_CTX != block_mask.padded_length:
+                raise ValueError(
+                    "Internally padded Q/K/V length must equal block_mask.padded_length, "
+                    f"got {N_CTX} and {block_mask.padded_length}."
+                )
+            if block_mask.mask_batch_size not in (1, Z):
+                raise ValueError(
+                    "block_mask batch dimension must be 1 or Q batch size, got "
+                    f"{block_mask.mask_batch_size} and {Z}."
+                )
+            if block_mask.mask_heads not in (1, H):
+                raise ValueError(
+                    "block_mask head dimension must be 1 or Q head count, got "
+                    f"{block_mask.mask_heads} and {H}."
+                )
+            if block_mask.device != q.device:
+                raise ValueError("block_mask and Q/K/V must be on the same device.")
 
         # Initialize arguments and tensors
         if sm_scale is None:
             sm_scale = HEAD_DIM_K**-0.5
+
+        if block_mask is not None:
+            o, o_t, M = sparse_attention_forward(
+                q,
+                k,
+                v,
+                q_t,
+                k_t,
+                v_t,
+                block_mask,
+                sm_scale,
+                compiling=compiling,
+                use_tma=USE_TMA,
+            )
+            return o, (o_t, M, sm_scale, q.new_empty(0), 0)
 
         o = torch.empty_like(q)
         o_t: Tensor | None = torch.empty_like(q_t) if ENABLE_JVP else None
@@ -2608,7 +2817,7 @@ class JVPAttn(Function):
                 # NOTE: For backward pass with HEAD_DIM_K=128, this is probably too low for H100; register allocation fails.
                 extra_kern_args["maxnreg"] = 80
 
-        if hasattr(triton, "set_allocator") and is_cuda():
+        if hasattr(triton, "set_allocator") and is_cuda() and not compiling:
 
             def alloc_fn(size: int, align: int, _):
                 """Custom allocator function for Triton."""
@@ -2628,8 +2837,8 @@ class JVPAttn(Function):
         elif attn_mask.dtype == torch.bool:
             MASK_TYPE = 1
             mask_tensor = attn_mask.contiguous()
-            mask_strides = strides_zhnd(mask_tensor)
-            if verify_attn_mask:
+            mask_strides = (0, 0, 0, 0) if compiling else _dense_mask_strides(mask_tensor)
+            if verify_attn_mask and not compiling:
                 # Check if any head is all False
                 assert mask_tensor.any(
                     dim=(-1, -2)
@@ -2637,8 +2846,8 @@ class JVPAttn(Function):
         else:
             MASK_TYPE = 2
             mask_tensor = attn_mask.to(q.dtype).contiguous()
-            mask_strides = strides_zhnd(mask_tensor)
-            if verify_attn_mask:
+            mask_strides = (0, 0, 0, 0) if compiling else _dense_mask_strides(mask_tensor)
+            if verify_attn_mask and not compiling:
                 # Check if the mask contains -inf/inf/NaN or is all (or no) MASK_CONST for any head
                 assert not torch.isinf(
                     mask_tensor
@@ -2669,27 +2878,29 @@ class JVPAttn(Function):
             """Determine grid configuration."""
             return (triton.cdiv(N_CTX, META["BLOCK_M"]), Z_H, 1)  # was JVPAttn.Grid
 
-        if ENABLE_JVP and _is_compiling():
-            if q_t is None or k_t is None or v_t is None:
+        if compiling:
+            if ENABLE_JVP and (q_t is None or k_t is None or v_t is None):
                 raise RuntimeError(
                     "Expected dual tangents q_t, k_t, v_t when compiling JVP attention."
                 )
-            with torch.no_grad():
-                o, o_t, M = _attn_fwd_dual_triton(
-                    q,
-                    k,
-                    v,
-                    q_t,
-                    k_t,
-                    v_t,
-                    mask_tensor,
-                    sm_scale,
-                    dropout_p,
-                    philox_seed,
-                    causal,
-                    warp_specialize,
-                    MASK_TYPE,
-                )
+            compiled_o_t: Tensor
+            o, compiled_o_t, M = _attn_fwd_triton(
+                q,
+                k,
+                v,
+                q if q_t is None else q_t,
+                k if k_t is None else k_t,
+                v if v_t is None else v_t,
+                mask_tensor,
+                sm_scale,
+                dropout_p,
+                philox_seed,
+                causal,
+                warp_specialize,
+                MASK_TYPE,
+                ENABLE_JVP,
+            )
+            o_t = compiled_o_t if ENABLE_JVP else None
         elif USE_TMA and supports_tma():
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * N_CTX
@@ -2850,19 +3061,14 @@ class JVPAttn(Function):
             (  # was JVPAttn.FwdOutCtxContrib
                 o_t,
                 M,
-                grid,
-                HEAD_DIM_K,
                 sm_scale,
                 mask_tensor,
                 MASK_TYPE,
-                dropout_p,
-                philox_seed,
-                ENABLE_DROPOUT,
             ),
         )
 
     @staticmethod
-    def setup_context(ctx: JVPAttn.FnCtx, inputs, outputs: JVPAttn.FwdOut) -> Tensor:
+    def setup_context(ctx: JVPAttn.FnCtx, inputs, outputs: JVPAttn.FwdOut) -> None:
         """Set up the context for JVP Attention.
 
         Args:
@@ -2870,47 +3076,26 @@ class JVPAttn(Function):
             inputs: The input tensors
             outputs: The output tensors
         """
-        (
-            q,
-            k,
-            v,
-            q_t,
-            k_t,
-            v_t,
-            attn_mask,
-            dropout_p,
-            causal,
-            sm_scale,
-            warp_specialize,
-            USE_TMA,
-            verify_attn_mask,
-        ) = inputs
+        q, k, v = inputs[:3]
+        causal = inputs[8]
+        block_mask = inputs[13]
 
         o, (
             o_t,
             M,
-            grid,
-            HEAD_DIM_K,
             sm_scale,
             mask_tensor,
             MASK_TYPE,
-            dropout_p,
-            philox_seed,
-            ENABLE_DROPOUT,
         ) = outputs
 
-        ctx.grid = grid
         ctx.save_for_forward(o_t)
         ctx.save_for_backward(q, k, v, o, M)
 
         ctx.sm_scale = sm_scale
-        ctx.HEAD_DIM_K = HEAD_DIM_K
         ctx.causal = causal
         ctx.mask_tensor = mask_tensor
         ctx.MASK_TYPE = MASK_TYPE
-        ctx.dropout_p = dropout_p
-        ctx.philox_seed = philox_seed
-        ctx.ENABLE_DROPOUT = ENABLE_DROPOUT
+        ctx.block_mask = block_mask
 
     @staticmethod
     def fwd(
@@ -2924,6 +3109,7 @@ class JVPAttn(Function):
         warp_specialize: bool = True,
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
+        block_mask: BlockSparseMask | None = None,
     ) -> Tensor:
         """Forward pass for JVP Attention.
 
@@ -2942,13 +3128,38 @@ class JVPAttn(Function):
             sm_scale: The softmax scale factor.
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
-            verify_attn_mask: Whether to verify the correctness of the provided attention mask.
+            verify_attn_mask: Whether to check attention-mask values during eager
+                execution. Shape, dtype, and device are always validated.
+            block_mask: Optional precomputed 32x32 block-sparse Boolean mask.
+                This is mutually exclusive with ``attn_mask`` and ``causal``.
 
         Returns:
             The output tensor.
         """
+        q, k, v, original_length = _pad_sparse_inputs(q, k, v, block_mask)
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+
+        if _is_compiling():
+            a, _ = JVPAttn.forward(
+                q,
+                k,
+                v,
+                None,
+                None,
+                None,
+                attn_mask,
+                dropout_p,
+                causal,
+                sm_scale,
+                warp_specialize,
+                USE_TMA,
+                verify_attn_mask,
+                block_mask,
+            )
+            if original_length is not None:
+                a = a[..., :original_length, :]
+            return a
 
         out: JVPAttn.FwdOut = JVPAttn.apply(
             q,
@@ -2964,9 +3175,12 @@ class JVPAttn(Function):
             warp_specialize,
             USE_TMA,
             verify_attn_mask,
+            block_mask,
         )
 
         a, _ = out
+        if original_length is not None:
+            a = a[..., :original_length, :]
         return a
 
     @staticmethod
@@ -2981,6 +3195,7 @@ class JVPAttn(Function):
         warp_specialize: bool = True,
         USE_TMA: bool = True,
         verify_attn_mask: bool = True,
+        block_mask: BlockSparseMask | None = None,
     ) -> Tensor:
         """Forward pass for JVP Attention with dual tensor inputs.
 
@@ -2999,26 +3214,29 @@ class JVPAttn(Function):
             sm_scale: The softmax scale factor.
             warp_specialize: Whether to use warp specialization.
             USE_TMA: Whether to use TMA.
-            verify_attn_mask: Whether to verify the correctness of the provided attention mask.
+            verify_attn_mask: Whether to check attention-mask values during eager
+                execution. Shape, dtype, and device are always validated.
+            block_mask: Optional precomputed 32x32 block-sparse Boolean mask.
+                This is mutually exclusive with ``attn_mask`` and ``causal``.
 
         Returns:
             The output tensor.
         """
+        q, k, v, original_length = _pad_sparse_inputs(q, k, v, block_mask)
         if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
 
         q_p, q_t = fwAD.unpack_dual(q)
         k_p, k_t = fwAD.unpack_dual(k)
         v_p, v_t = fwAD.unpack_dual(v)
+        if any(tangent is not None for tangent in (q_t, k_t, v_t)):
+            q_t = torch.zeros_like(q_p) if q_t is None else q_t
+            k_t = torch.zeros_like(k_p) if k_t is None else k_t
+            v_t = torch.zeros_like(v_p) if v_t is None else v_t
 
         if _is_compiling() and q_t is not None and k_t is not None and v_t is not None:
             o, (
                 o_t,
-                _,
-                _,
-                _,
-                _,
-                _,
                 _,
                 _,
                 _,
@@ -3037,8 +3255,12 @@ class JVPAttn(Function):
                 warp_specialize,
                 USE_TMA,
                 verify_attn_mask,
+                block_mask,
             )
-            return fwAD.make_dual(o, o_t)
+            dual_output = fwAD.make_dual(o, o_t)
+            if original_length is not None:
+                dual_output = dual_output[..., :original_length, :]
+            return dual_output
 
         # NOTE: We pass some dualtensor args to ensure jvp() will be called,
         # but we also pass tangents separately, as forward() demotes dual
@@ -3057,9 +3279,12 @@ class JVPAttn(Function):
             warp_specialize,
             USE_TMA,
             verify_attn_mask,
+            block_mask,
         )
 
         a, _ = out
+        if original_length is not None:
+            a = a[..., :original_length, :]
         return a
 
     @staticmethod
@@ -3126,104 +3351,33 @@ class JVPAttn(Function):
             f"o.stride()={o.stride()}, do.stride()={do.stride()}"
         )
 
-        # Initialize tensors for gradients
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-        delta = torch.empty_like(M)
-
-        # Collect metadata
-        Z, H, N_CTX = q.shape[:3]
-
-        BLK_SLICE_FACTOR = 2  # NOTE: This is a safe default value to reduce backward memory usage
-        BLOCK_MIN = MIN_SEQUENCE_LENGTH  # NOTE: Adjust according to minimum input sequence length
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = BLOCK_MIN, BLOCK_MIN, BLOCK_MIN, BLOCK_MIN
-
-        assert N_CTX % BLOCK_MIN == 0, f"N_CTX must be divisible by BLOCK_MIN={BLOCK_MIN}"
-
-        if not ctx.causal:
-            assert (
-                BLOCK_M1 == BLOCK_M2 == BLOCK_N1 == BLOCK_N2
-            ), "For non-causal attention, all block sizes must be equal."
-
-        # Scale k by sm_scale / ln(2) to account for softmax scaling and
-        # change-of-base of exponentiation (exp2).
-        RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
-
-        # Determine mask type
-        if ctx.MASK_TYPE == 0:
-            mask_strides = (0, 0, 0, 0)
-        else:
-            mask_strides = (
-                ctx.mask_tensor.stride(0),
-                ctx.mask_tensor.stride(1),
-                ctx.mask_tensor.stride(2),
-                ctx.mask_tensor.stride(3),
+        if ctx.block_mask is not None:
+            dq, dk, dv = sparse_attention_backward(
+                unwrap(q),
+                unwrap(k),
+                unwrap(v),
+                unwrap(o),
+                unwrap(M),
+                do,
+                ctx.block_mask,
+                ctx.sm_scale,
             )
+            return dq, dk, dv, *([None] * 11)
 
-        # Set up grid for kernel launch
-        Z_H = Z * H
-
-        # Preprocess output's deltas
-        pre_grid = (N_CTX // BLOCK_MIN, Z_H)
-        _attn_bwd_preprocess[pre_grid](
-            unwrap(o),
-            do,  #
-            delta,  #
-            N_CTX,  #
-            BLOCK_M=BLOCK_MIN,
-            HEAD_DIM=ctx.HEAD_DIM_K,  #
-        )
-
-        # Launch the backward kernel, enabling pipelining for backward pass on A100s
-        grid = (N_CTX // BLOCK_MIN, Z_H)
-        bwd_kernel = _attn_bwd_causal if ctx.causal else _attn_bwd
-        num_stages = (
-            5
-            if is_cuda() and torch.cuda.get_device_capability()[0] == 9
-            else NUM_STAGES_OPTIONS[0]
-        )
-
-        bwd_kernel[grid](
+        dq, dk, dv = _launch_dense_backward(
             unwrap(q),
-            arg_k,
+            unwrap(k),
             unwrap(v),
-            ctx.sm_scale,
-            do,
-            dq,
-            dk,
-            dv,  #
+            unwrap(o),
             unwrap(M),
-            delta,  #
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            q.stride(3),  #
-            mask_strides[0],
-            mask_strides[1],
-            mask_strides[2],
-            mask_strides[3],  #
-            H,
-            N_CTX,  #
-            BLOCK_M1=BLOCK_M1,
-            BLOCK_N1=BLOCK_N1,  #
-            BLOCK_M2=BLOCK_M2,
-            BLOCK_N2=BLOCK_N2,  #
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM_K,  #
-            mask_ptr=unwrap(ctx.mask_tensor),
-            MASK_TYPE=ctx.MASK_TYPE,
-            dropout_p=ctx.dropout_p,
-            philox_seed=ctx.philox_seed,
-            ENABLE_DROPOUT=ctx.ENABLE_DROPOUT,
-            # NOTE: The following are safe (unit-tested) default values
-            num_stages=num_stages,  #
-            num_warps=4,  #
+            do,
+            unwrap(ctx.mask_tensor),
+            ctx.sm_scale,
+            ctx.causal,
+            ctx.MASK_TYPE,
         )
 
-        return (dq, dk, dv, None, None, None, None, None, None, None, None, None, None)  # was JVPAttn.BwdOut
+        return (dq, dk, dv, *([None] * 11))  # was JVPAttn.BwdOut
 
 
 attention = JVPAttn.fwd

@@ -66,6 +66,7 @@ repos:
     rev: 1.7.0 # or master if you're bold
     hooks:
       - id: interrogate
+        exclude: ^(tests|benchmarks)/
         args:
           [
             --verbose,
@@ -132,7 +133,7 @@ repos:
       - id: codespell
         args:
           - --skip=logs/**,data/**,*.ipynb
-          # - --ignore-words-list=abc,def
+          - --ignore-words-list=dout
 
   # jupyter notebook cell output clearing
   - repo: https://github.com/kynan/nbstripout

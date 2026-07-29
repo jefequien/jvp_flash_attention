@@ -786,11 +786,11 @@ def run_benchmark_suite(args: Args) -> list[BenchmarkResult]:
                                 seq_len=seq_len,
                                 is_causal=is_causal,
                                 method="sdpa",
-                                time_ms=np.nan,
-                                memory_allocated_mb=np.nan,
-                                memory_reserved_mb=np.nan,
+                                time_ms=float("nan"),
+                                memory_allocated_mb=float("nan"),
+                                memory_reserved_mb=float("nan"),
                                 mask_type=mask_type,
-                                flops=np.nan,
+                                flops=float("nan"),
                                 accuracy=None,
                             )
                         )
@@ -799,11 +799,11 @@ def run_benchmark_suite(args: Args) -> list[BenchmarkResult]:
                                 seq_len=seq_len,
                                 is_causal=is_causal,
                                 method="jvp_attn",
-                                time_ms=np.nan,
-                                memory_allocated_mb=np.nan,
-                                memory_reserved_mb=np.nan,
+                                time_ms=float("nan"),
+                                memory_allocated_mb=float("nan"),
+                                memory_reserved_mb=float("nan"),
                                 mask_type=mask_type,
-                                flops=np.nan,
+                                flops=float("nan"),
                                 accuracy=accuracy_metrics,
                             )
                         )

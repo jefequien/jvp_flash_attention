@@ -57,12 +57,13 @@ filterwarnings = [
 ]
 log_cli = "True"
 markers = [
+  "cuda: tests that require a CUDA device",
   "slow: slow tests",
 ]
 minversion = "6.0"
 testpaths = "tests/"
 
-# Assuming you're developing for Python 3.10
+[tool.ruff]
 target-version = "py310"
 
 [tool.hatch.metadata]
@@ -70,6 +71,27 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["jvp_flash_attention"]
+
+[tool.uv]
+constraint-dependencies = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.17",
+]
 
 [tool.coverage.report]
 exclude_lines = [

@@ -30,6 +30,13 @@ pip install -e .
 pre-commit install
 ```
 
+The repository also contains a locked uv development environment matching the
+CUDA/Triton setup used for the block-sparse kernels:
+
+```bash
+uv sync --python 3.11 --group dev --extra lint
+```
+
 ## Usage
 
 Once installed, one can use `jvp_flash_attention` in place of PyTorch's `scaled_dot_product_attention` as follows.
@@ -65,6 +72,49 @@ Anecdotally, one can also swap out `F.scaled_dot_product_attention` with `jvp_at
 > Note: If calling `torch.func.jvp` manually in your model's forward pass like
 > `pred, df = torch.func.jvp(*(lambda x_jvp: model(x_jvp), (x,), (gt,)))`,
 > make sure to use JVP Flash Attention in your model as `model = lambda q, k, v: JVPAttn.fwd_dual(q, k, v)` instead of as `model = lambda q, k, v: jvp_attention(q, k, v)` to ensure each input's tangent vectors are computed [prior](https://github.com/amorehead/jvp_flash_attention/issues/10) to running PyTorch's `autograd` engine. Models that rely on `torch.autograd.grad` to compute higher-order derivatives in their forward pass (e.g., energy-based models) should not require this change.
+
+### Block-sparse Boolean masks
+
+`BlockSparseMask` precomputes a 32x32 tile schedule while retaining exact
+element-level masks for partial tiles. Construct it once and cache it outside
+the model hot path:
+
+```python
+import torch
+
+from jvp_flash_attention import BlockSparseMask, JVPAttn
+
+# True means visible. A shared [N, N] mask avoids a [B, H, N, N] expansion.
+boolean_mask = torch.ones(sequence, sequence, dtype=torch.bool, device="cuda").tril()
+block_mask = BlockSparseMask.from_bool(boolean_mask)
+
+def attention(q, k, v):
+    return JVPAttn.fwd_dual(q, k, v, block_mask=block_mask)
+
+primal, tangent = torch.func.jvp(attention, (q, k, v), (dq, dk, dv))
+```
+
+Masks may be `[N, N]` or `[mask_batch, mask_heads, N, N]`; batch and head
+dimensions can be `1` for broadcasting or match Q. `attn_mask` and
+`block_mask` are mutually exclusive. Non-multiples of 32 are padded internally,
+and outputs are sliced back to `N`. Every real query row must expose at least
+one key.
+
+The same API supports direct forward-AD dual tensors, `torch.func.jvp`,
+ordinary reverse-mode dQ/dK/dV, and `torch.compile`. Both TMA
+(`USE_TMA=True`) and pointer-based (`USE_TMA=False`) sparse forward paths are
+available. Move cached metadata with `block_mask.to(device)` and use
+`block_mask.to_dense()` only for debugging.
+
+Compiled reverse mode is defined for the primal output only. The compiled
+tangent output is intentionally non-differentiable; detach it before including
+it in a loss, as in the pixel mean-flow training path. Reverse mode through the
+tangent itself is not part of the block-sparse contract.
+
+The initial sparse path is for square self-attention with Boolean masks. It
+does not support sparse additive biases, cross-attention, or attention
+dropout. Supported dtypes are float16, bfloat16, and float32; supported head
+dimensions are 16, 32, 64, 128, and 256.
 
 Contributions or enhancements are welcome!
 
@@ -109,7 +159,35 @@ Model training with either `F.scaled_dot_product_attention` or `JVPAttn.fwd_dual
 If you want to run all the unit tests verifying the correctness of the JVP Flash Attention Triton kernel, run the following command(s).
 
 ```bash
-python tests/test_jvp_attention.py --dtype {float16,bfloat16,float32}
+uv run pytest -m "not slow"
+CUDA_VISIBLE_DEVICES=0 uv run pytest -m slow
+
+# Compatibility correctness harness
+CUDA_VISIBLE_DEVICES=0 uv run python tests/test_jvp_attention.py \
+  --dtype bfloat16 --seq-lengths 32 --no-benchmark-performance
+```
+
+The realistic pixel mean-flow benchmark is self-contained and does not import
+`jit_sandbox`:
+
+```bash
+# Default pMF-B mask, all primal/JVP/ordinary-backward workloads
+CUDA_VISIBLE_DEVICES=0 uv run python benchmarks/benchmark_block_sparse.py
+
+# All pMF mask modes and register-token ablations
+CUDA_VISIBLE_DEVICES=0 uv run python benchmarks/benchmark_block_sparse.py \
+  --matrix --batch 1 2 --workloads dual dual_backward
+
+# Compiled execution, a 256x512 non-gating case, and occupancy crossover sweep
+CUDA_VISIBLE_DEVICES=0 uv run python benchmarks/benchmark_block_sparse.py --compiled
+CUDA_VISIBLE_DEVICES=0 uv run python benchmarks/benchmark_block_sparse.py \
+  --extended --workloads dual dual_backward
+CUDA_VISIBLE_DEVICES=0 uv run python benchmarks/benchmark_block_sparse.py \
+  --density-sweep --workloads dual
+
+# Optional primal-only FlexAttention context (FlexAttention has no JVP)
+CUDA_VISIBLE_DEVICES=0 uv run python benchmarks/benchmark_block_sparse.py \
+  --include-flex --workloads primal primal_backward
 ```
 
 In principle, the kernel should support ROCm systems as well, though it has not yet been tested on them. macOS is currently unsupported except using a CPU-only backend.
