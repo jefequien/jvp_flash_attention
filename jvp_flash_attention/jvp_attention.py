@@ -49,9 +49,7 @@ try:
 except ModuleNotFoundError:
     HAS_TENSOR_DESC = False
 
-MASK_CONST = (
-    -1.0e2
-)  # Use a large negative value for masking (compatible with float16, bfloat16, and float32)
+MASK_CONST = -1.0e2  # Use a large negative value for masking (compatible with float16, bfloat16, and float32)
 MIN_SEQUENCE_LENGTH = 32  # NOTE: All sequence lengths must be multiples of 2 >= 32
 
 
@@ -126,13 +124,12 @@ def _pad_sparse_inputs(
     v: Tensor,
     block_mask: BlockSparseMask | None,
 ) -> tuple[Tensor, Tensor, Tensor, int | None]:
-    """Validate dense inputs and pad square block-sparse inputs to 32-token tiles."""
+    """Validate inputs and pad block-sparse Q and K/V to 32-token tiles."""
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("Q/K/V must be rank-4 [batch, heads, sequence, head_dim].")
     if k.shape != v.shape:
         raise ValueError(
-            "JVP attention requires matching Q/K/V shapes except for the query "
-            "sequence length; K/V must match."
+            "JVP attention requires matching Q/K/V shapes except for the query sequence length; K/V must match."
         )
     if q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]:
         raise ValueError(
@@ -145,43 +142,46 @@ def _pad_sparse_inputs(
         raise TypeError("JVP attention requires matching Q/K/V dtypes.")
     if block_mask is None:
         return q, k, v, None
-    if q.shape != k.shape:
-        raise ValueError("Block-sparse JVP attention requires square self-attention.")
     if block_mask.block_size != MIN_SEQUENCE_LENGTH:
-        raise ValueError(
-            f"block_mask.block_size must be {MIN_SEQUENCE_LENGTH}, "
-            f"got {block_mask.block_size}."
-        )
-    expected_padded_length = (
-        (block_mask.original_length + MIN_SEQUENCE_LENGTH - 1)
-        // MIN_SEQUENCE_LENGTH
-        * MIN_SEQUENCE_LENGTH
+        raise ValueError(f"block_mask.block_size must be {MIN_SEQUENCE_LENGTH}, got {block_mask.block_size}.")
+    expected_padded_query_length = (
+        (block_mask.query_length + MIN_SEQUENCE_LENGTH - 1) // MIN_SEQUENCE_LENGTH * MIN_SEQUENCE_LENGTH
     )
-    if block_mask.padded_length != expected_padded_length:
+    expected_padded_kv_length = (
+        (block_mask.kv_length + MIN_SEQUENCE_LENGTH - 1) // MIN_SEQUENCE_LENGTH * MIN_SEQUENCE_LENGTH
+    )
+    if block_mask.padded_query_length != expected_padded_query_length:
         raise ValueError(
-            "block_mask.padded_length must be the original length rounded up to "
-            f"{MIN_SEQUENCE_LENGTH}, got {block_mask.padded_length} for "
-            f"length {block_mask.original_length}."
+            "block_mask.padded_length (padded_query_length) must be the query "
+            "length rounded up "
+            f"to {MIN_SEQUENCE_LENGTH}, got {block_mask.padded_query_length} for "
+            f"length {block_mask.query_length}."
+        )
+    if block_mask.padded_key_value_length != expected_padded_kv_length:
+        raise ValueError(
+            "block_mask.padded_key_value_length must be the key/value length "
+            f"rounded up to {MIN_SEQUENCE_LENGTH}, got "
+            f"{block_mask.padded_key_value_length} for length "
+            f"{block_mask.kv_length}."
         )
     if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise TypeError(
-            f"Block-sparse attention supports float16, bfloat16, and float32, got {q.dtype}."
-        )
-    if q.shape[2] != block_mask.original_length:
+        raise TypeError(f"Block-sparse attention supports float16, bfloat16, and float32, got {q.dtype}.")
+    if q.shape[2] != block_mask.query_length or k.shape[2] != block_mask.kv_length:
         raise ValueError(
-            "Q/K/V sequence length must match block_mask.original_length, got "
-            f"{q.shape[2]} and {block_mask.original_length}."
+            "Q and K/V lengths must match the block mask geometry, got "
+            f"Q={q.shape[2]}, K/V={k.shape[2]}, mask="
+            f"({block_mask.query_length}, {block_mask.kv_length})."
         )
     if block_mask.device != q.device:
-        raise ValueError(
-            f"block_mask must be on the same device as Q/K/V, got {block_mask.device} "
-            f"and {q.device}."
-        )
-    pad_tokens = block_mask.padded_length - block_mask.original_length
-    if pad_tokens:
-        padding = (0, 0, 0, pad_tokens)
-        q, k, v = F.pad(q, padding), F.pad(k, padding), F.pad(v, padding)
-    return q, k, v, block_mask.original_length
+        raise ValueError(f"block_mask must be on the same device as Q/K/V, got {block_mask.device} and {q.device}.")
+    query_padding = block_mask.padded_query_length - block_mask.query_length
+    kv_padding = block_mask.padded_key_value_length - block_mask.kv_length
+    if query_padding:
+        q = F.pad(q, (0, 0, 0, query_padding))
+    if kv_padding:
+        k = F.pad(k, (0, 0, 0, kv_padding))
+        v = F.pad(v, (0, 0, 0, kv_padding))
+    return q, k, v, block_mask.query_length
 
 
 @triton.jit
@@ -737,9 +737,7 @@ def prune_invalid_configs(configs, named_args, **kwargs):
     # Filter out configs where BLOCK_M > N_CTX or BLOCK_M <= MIN_SEQUENCE_LENGTH, as
     # BLOCK_M = MIN_SEQUENCE_LENGTH often leads to reduced numerical accuracy for longer sequences
     # TODO: Find out why this occurs
-    return [
-        conf for conf in configs if MIN_SEQUENCE_LENGTH < conf.kwargs.get("BLOCK_M", 0) <= N_CTX
-    ]
+    return [conf for conf in configs if MIN_SEQUENCE_LENGTH < conf.kwargs.get("BLOCK_M", 0) <= N_CTX]
 
 
 @triton.jit
@@ -911,9 +909,7 @@ def _attn_fwd(
     off_hz = tl.program_id(
         1
     )  # Which head and batch element to process, with a program being a single head of a single batch element
-    off_z = (
-        off_hz // H
-    )  # Which batch element this program is assigned to (n.b., each batch element has H heads)
+    off_z = off_hz // H  # Which batch element this program is assigned to (n.b., each batch element has H heads)
     off_h = off_hz % H  # The position of the head to process in the batch
 
     q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
@@ -1137,9 +1133,7 @@ def _attn_fwd(
     # Epilogue
     empty_mask = l_i == 0.0
     if empty_mask.sum() > 0:
-        l_i = tl.where(
-            empty_mask, 1.0, l_i
-        )  # NOTE: This happens if the entire block is masked out.
+        l_i = tl.where(empty_mask, 1.0, l_i)  # NOTE: This happens if the entire block is masked out.
 
     m_i = m_i + tl.where(
         # NOTE: This is needed to compute the logsumexp for the backward pass.
@@ -1286,9 +1280,7 @@ def _attn_fwd_tma(
     off_hz = tl.program_id(
         1
     )  # Which head and batch element to process, with a program being a single head of a single batch element
-    off_z = (
-        off_hz // H
-    )  # Which batch element this program is assigned to (n.b., each batch element has H heads)
+    off_z = off_hz // H  # Which batch element this program is assigned to (n.b., each batch element has H heads)
     off_h = off_hz % H  # The position of the head to process in the batch
 
     # Initialize tensor descriptors
@@ -1307,9 +1299,7 @@ def _attn_fwd_tma(
         v_shape = [y_dim, HEAD_DIM]
         v_strides = [HEAD_DIM, 1]
         v_block_shape = [BLOCK_N, HEAD_DIM]
-    desc_v = _maybe_make_tensor_desc(
-        desc_v, shape=v_shape, strides=v_strides, block_shape=v_block_shape
-    )
+    desc_v = _maybe_make_tensor_desc(desc_v, shape=v_shape, strides=v_strides, block_shape=v_block_shape)
     desc_k = _maybe_make_tensor_desc(
         desc_k,
         shape=[y_dim, HEAD_DIM],
@@ -1370,9 +1360,7 @@ def _attn_fwd_tma(
             t_v_shape = [y_dim, HEAD_DIM]
             t_v_strides = [HEAD_DIM, 1]
             t_v_block_shape = [BLOCK_N, HEAD_DIM]
-        desc_v_t = _maybe_make_tensor_desc(
-            desc_v_t, shape=t_v_shape, strides=t_v_strides, block_shape=t_v_block_shape
-        )
+        desc_v_t = _maybe_make_tensor_desc(desc_v_t, shape=t_v_shape, strides=t_v_strides, block_shape=t_v_block_shape)
         desc_k_t = _maybe_make_tensor_desc(
             desc_k_t,
             shape=[y_dim, HEAD_DIM],
@@ -1486,9 +1474,7 @@ def _attn_fwd_tma(
     # Epilogue
     empty_mask = l_i == 0.0
     if empty_mask.sum() > 0:
-        l_i = tl.where(
-            empty_mask, 1.0, l_i
-        )  # NOTE: This happens if the entire block is masked out.
+        l_i = tl.where(empty_mask, 1.0, l_i)  # NOTE: This happens if the entire block is masked out.
 
     m_i = m_i + tl.where(
         # NOTE: This is needed to compute the logsumexp for the backward pass.
@@ -1510,7 +1496,12 @@ def _attn_fwd_tma(
 
 @triton.jit
 def _attn_bwd_preprocess(
-    O, DO, Delta, N_CTX, BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr  # noqa: E741
+    O,
+    DO,
+    Delta,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    HEAD_DIM: tl.constexpr,  # noqa: E741
 ):
     """Preprocess output deltas for the backward attention pass.
 
@@ -1529,9 +1520,7 @@ def _attn_bwd_preprocess(
 
     # Load outputs and gradients
     o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :])
-    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(
-        tl.float32
-    )
+    do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :]).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
 
     # Write-back the intermediate delta results
@@ -1616,9 +1605,7 @@ def _attn_bwd_dkdv(
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_h[None, :] * stride_d
 
     if MASK_TYPE > 0:
-        mask_ptr = (
-            mask_ptr + offs_m[None, :] * mask_stride_tok1 + offs_n[:, None] * mask_stride_tok2
-        )
+        mask_ptr = mask_ptr + offs_m[None, :] * mask_stride_tok1 + offs_n[:, None] * mask_stride_tok2
 
     # NOTE: BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
@@ -1765,9 +1752,7 @@ def _attn_bwd_dq(
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_h[:, None] * stride_d
 
     if MASK_TYPE > 0:
-        mask_ptr = (
-            mask_ptr + offs_m[:, None] * mask_stride_tok1 + offs_n[None, :] * mask_stride_tok2
-        )
+        mask_ptr = mask_ptr + offs_m[:, None] * mask_stride_tok1 + offs_n[None, :] * mask_stride_tok2
 
     # NOTE: D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m)
@@ -1919,9 +1904,7 @@ def _attn_bwd_causal(
     off_hz = tl.program_id(
         1
     )  # Which head and batch element to process, with a program being a single head of a single batch element
-    off_z = (
-        off_hz // H
-    )  # Which batch element this program is assigned to (n.b., each batch element has H heads)
+    off_z = off_hz // H  # Which batch element this program is assigned to (n.b., each batch element has H heads)
     off_h = off_hz % H  # The position of the head to process in the batch
 
     # NOTE: This allows one to get the (N_CTX, HEAD_DIM) block in Q, K, V, etc. by indexing it by batch and head
@@ -2217,9 +2200,7 @@ def _attn_bwd(
     off_hz = tl.program_id(
         1
     )  # Which head and batch element to process, with a program being a single head of a single batch element
-    off_z = (
-        off_hz // H
-    )  # Which batch element this program is assigned to (n.b., each batch element has H heads)
+    off_z = off_hz // H  # Which batch element this program is assigned to (n.b., each batch element has H heads)
     off_h = off_hz % H  # The position of the head to process in the batch
 
     # NOTE: This allows one to get the (N_CTX, HEAD_DIM) block in Q, K, V, etc. by indexing it by batch and head
@@ -2402,23 +2383,15 @@ def _attn_bwd_rect_dkdv(
     v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
     delta_offset = off_hz * Q_LEN
 
-    k = tl.load(
-        K + k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-    )
-    v = tl.load(
-        V + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-    )
+    k = tl.load(K + k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+    v = tl.load(V + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
     dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
     for start_m in range(0, Q_LEN, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        q = tl.load(
-            Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        )
-        do = tl.load(
-            DO + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        )
+        q = tl.load(Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+        do = tl.load(DO + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
         m = tl.load(M + delta_offset + offs_m)
         delta = tl.load(D + delta_offset + offs_m)
 
@@ -2480,24 +2453,16 @@ def _attn_bwd_rect_dq(
     v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
     delta_offset = off_hz * Q_LEN
 
-    q = tl.load(
-        Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    )
-    do = tl.load(
-        DO + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    )
+    q = tl.load(Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    do = tl.load(DO + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
     m = tl.load(M + delta_offset + offs_m)[:, None]
     delta = tl.load(D + delta_offset + offs_m)
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     for start_n in range(0, KV_LEN, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        k = tl.load(
-            K + k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-        )
-        v = tl.load(
-            V + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-        )
+        k = tl.load(K + k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+        v = tl.load(V + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
         p = tl.math.exp2(tl.dot(q, tl.trans(k)) - m)
         dp = tl.dot(do, tl.trans(v)).to(tl.float32)
         ds = p * (dp - delta[:, None])
@@ -2553,9 +2518,7 @@ def _attn_fwd_triton(
         extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
     if is_cuda() and warp_specialize:
-        extra_kern_args["maxnreg"] = (
-            168 if (HEAD_DIM_K == 128 and q.dtype == torch.float16) or enable_jvp else 80
-        )
+        extra_kern_args["maxnreg"] = 168 if (HEAD_DIM_K == 128 and q.dtype == torch.float16) or enable_jvp else 80
 
     if hasattr(triton, "set_allocator") and is_cuda():
 
@@ -2688,9 +2651,7 @@ def _launch_dense_backward(
     KV_LEN = k.shape[2]
     block = MIN_SEQUENCE_LENGTH
     if Q_LEN % block or KV_LEN % block:
-        raise ValueError(
-            f"Dense backward requires query and key/value lengths divisible by {block}."
-        )
+        raise ValueError(f"Dense backward requires query and key/value lengths divisible by {block}.")
     scaled_k = k * (sm_scale * 1.4426950408889634)
     mask_strides = (0, 0, 0, 0) if mask_type == 0 else _dense_mask_strides(mask_tensor)
     q_grid = (Q_LEN // block, Z * H)
@@ -2704,9 +2665,7 @@ def _launch_dense_backward(
     )
     if Q_LEN != KV_LEN:
         if causal or mask_type != 0:
-            raise NotImplementedError(
-                "Rectangular dense backward supports only unmasked, noncausal attention."
-            )
+            raise NotImplementedError("Rectangular dense backward supports only unmasked, noncausal attention.")
         strides_q = (q.stride(0), q.stride(1), q.stride(2), q.stride(3))
         strides_k = (
             scaled_k.stride(0),
@@ -2762,9 +2721,7 @@ def _launch_dense_backward(
 
     grid = q_grid
     bwd_kernel = _attn_bwd_causal if causal else _attn_bwd
-    num_stages = (
-        5 if is_cuda() and torch.cuda.get_device_capability()[0] == 9 else NUM_STAGES_OPTIONS[0]
-    )
+    num_stages = 5 if is_cuda() and torch.cuda.get_device_capability()[0] == 9 else NUM_STAGES_OPTIONS[0]
     bwd_kernel[grid](
         q,
         scaled_k,
@@ -3006,10 +2963,7 @@ class JVPAttn(Function):
         ENABLE_JVP = ENABLE_Q_JVP or ENABLE_K_JVP or ENABLE_V_JVP
 
         if k.shape != v.shape:
-            raise ValueError(
-                f"JVP attention requires matching K/V shapes, got {tuple(k.shape)} "
-                f"and {tuple(v.shape)}."
-            )
+            raise ValueError(f"JVP attention requires matching K/V shapes, got {tuple(k.shape)} and {tuple(v.shape)}.")
         if q.shape[:2] != k.shape[:2]:
             raise ValueError(
                 "JVP attention requires matching Q/K/V batch and head dimensions, "
@@ -3022,8 +2976,7 @@ class JVPAttn(Function):
         ):
             if tangent is not None and tangent.shape != primal.shape:
                 raise ValueError(
-                    f"{name} shape must match its primal, got {tuple(tangent.shape)} "
-                    f"and {tuple(primal.shape)}."
+                    f"{name} shape must match its primal, got {tuple(tangent.shape)} and {tuple(primal.shape)}."
                 )
 
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V, (
@@ -3031,16 +2984,12 @@ class JVPAttn(Function):
             f" but got HEAD_DIM_Q={HEAD_DIM_Q}, HEAD_DIM_K={HEAD_DIM_K}, HEAD_DIM_V={HEAD_DIM_V}"
         )
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}, (
-            "JVP attention only supports HEAD_DIM_K in {16, 32, 64, 128, 256},"
-            f" but got HEAD_DIM_K={HEAD_DIM_K}",
+            f"JVP attention only supports HEAD_DIM_K in {{16, 32, 64, 128, 256}}, but got HEAD_DIM_K={HEAD_DIM_K}",
         )
         assert Q_LEN % 2 == 0 and Q_LEN >= 32, (
-            "JVP attention requires Q_LEN to be a multiple of 2 and >= 32,"
-            f" but got Q_LEN={Q_LEN}",
+            f"JVP attention requires Q_LEN to be a multiple of 2 and >= 32, but got Q_LEN={Q_LEN}",
         )
-        if Q_LEN != KV_LEN and (
-            Q_LEN % MIN_SEQUENCE_LENGTH or KV_LEN % MIN_SEQUENCE_LENGTH or KV_LEN < 32
-        ):
+        if Q_LEN != KV_LEN and (Q_LEN % MIN_SEQUENCE_LENGTH or KV_LEN % MIN_SEQUENCE_LENGTH or KV_LEN < 32):
             raise ValueError(
                 "Rectangular JVP attention requires query and key/value lengths divisible "
                 f"by {MIN_SEQUENCE_LENGTH} and at least {MIN_SEQUENCE_LENGTH}, got "
@@ -3049,10 +2998,8 @@ class JVPAttn(Function):
 
         if attn_mask is not None and block_mask is not None:
             raise ValueError("attn_mask and block_mask are mutually exclusive.")
-        if Q_LEN != KV_LEN and (causal or attn_mask is not None or block_mask is not None):
-            raise ValueError(
-                "Rectangular JVP attention currently supports only unmasked, noncausal attention."
-            )
+        if Q_LEN != KV_LEN and (causal or attn_mask is not None):
+            raise ValueError("Rectangular JVP attention currently supports only unmasked, noncausal attention.")
         if causal and (attn_mask is not None or block_mask is not None):
             raise ValueError("Causal attention does not support an explicit attention mask.")
         if attn_mask is not None:
@@ -3063,35 +3010,31 @@ class JVPAttn(Function):
                 and attn_mask.shape[2:] == (Q_LEN, KV_LEN)
             )
             if not valid_shape:
-                raise ValueError(
-                    "The attention mask must have shape [Q_LEN, KV_LEN] or "
-                    "[1|Z, 1|H, Q_LEN, KV_LEN]."
-                )
+                raise ValueError("The attention mask must have shape [Q_LEN, KV_LEN] or [1|Z, 1|H, Q_LEN, KV_LEN].")
             if attn_mask.dtype not in {torch.bool, q.dtype}:
                 raise TypeError(
-                    "The attention mask must be Boolean or have the query dtype, "
-                    f"got {attn_mask.dtype} and {q.dtype}."
+                    f"The attention mask must be Boolean or have the query dtype, got {attn_mask.dtype} and {q.dtype}."
                 )
             if attn_mask.device != q.device:
                 raise ValueError(
-                    "The attention mask and Q/K/V must be on the same device, "
-                    f"got {attn_mask.device} and {q.device}."
+                    f"The attention mask and Q/K/V must be on the same device, got {attn_mask.device} and {q.device}."
                 )
         if block_mask is not None:
-            if Q_LEN != block_mask.padded_length:
+            if Q_LEN != block_mask.padded_query_length or KV_LEN != block_mask.padded_key_value_length:
                 raise ValueError(
-                    "Internally padded Q/K/V length must equal block_mask.padded_length, "
-                    f"got {Q_LEN} and {block_mask.padded_length}."
+                    "Internally padded Q and K/V lengths must equal the block mask "
+                    "geometry, got "
+                    f"Q={Q_LEN}, K/V={KV_LEN}, mask="
+                    f"({block_mask.padded_query_length}, "
+                    f"{block_mask.padded_key_value_length})."
                 )
             if block_mask.mask_batch_size not in (1, Z):
                 raise ValueError(
-                    "block_mask batch dimension must be 1 or Q batch size, got "
-                    f"{block_mask.mask_batch_size} and {Z}."
+                    f"block_mask batch dimension must be 1 or Q batch size, got {block_mask.mask_batch_size} and {Z}."
                 )
             if block_mask.mask_heads not in (1, H):
                 raise ValueError(
-                    "block_mask head dimension must be 1 or Q head count, got "
-                    f"{block_mask.mask_heads} and {H}."
+                    f"block_mask head dimension must be 1 or Q head count, got {block_mask.mask_heads} and {H}."
                 )
             if block_mask.device != q.device:
                 raise ValueError("block_mask and Q/K/V must be on the same device.")
@@ -3144,7 +3087,12 @@ class JVPAttn(Function):
 
         def strides_zhnd(t: Tensor) -> tuple[int, int, int, int]:
             """Get strides for a tensor with shape (Z, H, sequence, head_dim)."""
-            return (t.stride(0), t.stride(1), t.stride(2), t.stride(3))  # was JVPAttn.Strides
+            return (
+                t.stride(0),
+                t.stride(1),
+                t.stride(2),
+                t.stride(3),
+            )  # was JVPAttn.Strides
 
         # Determine mask type
         if attn_mask is None:
@@ -3157,24 +3105,18 @@ class JVPAttn(Function):
             mask_strides = (0, 0, 0, 0) if compiling else _dense_mask_strides(mask_tensor)
             if verify_attn_mask and not compiling:
                 # Check if any head is all False
-                assert mask_tensor.any(
-                    dim=(-1, -2)
-                ).all(), "The attention mask cannot be all False for any head."
+                assert mask_tensor.any(dim=(-1, -2)).all(), "The attention mask cannot be all False for any head."
         else:
             MASK_TYPE = 2
             mask_tensor = attn_mask.to(q.dtype).contiguous()
             mask_strides = (0, 0, 0, 0) if compiling else _dense_mask_strides(mask_tensor)
             if verify_attn_mask and not compiling:
                 # Check if the mask contains -inf/inf/NaN or is all (or no) MASK_CONST for any head
-                assert not torch.isinf(
-                    mask_tensor
-                ).any(), "The attention mask cannot contain -inf or inf."
-                assert not torch.isnan(
-                    mask_tensor
-                ).any(), "The attention mask cannot contain NaNs."
-                assert (
-                    (mask_tensor != MASK_CONST).any(dim=(-1, -2)).all()
-                ), f"The attention mask cannot be all {MASK_CONST} (the masking constant) for any head."
+                assert not torch.isinf(mask_tensor).any(), "The attention mask cannot contain -inf or inf."
+                assert not torch.isnan(mask_tensor).any(), "The attention mask cannot contain NaNs."
+                assert (mask_tensor != MASK_CONST).any(dim=(-1, -2)).all(), (
+                    f"The attention mask cannot be all {MASK_CONST} (the masking constant) for any head."
+                )
 
                 if not (mask_tensor == MASK_CONST).any():
                     raise UserWarning(
@@ -3223,10 +3165,7 @@ class JVPAttn(Function):
             and supports_tma()
             and Q_LEN == KV_LEN
             and HEAD_DIM_K >= MIN_SEQUENCE_LENGTH
-            and (
-                not ENABLE_JVP
-                or (ENABLE_Q_JVP and ENABLE_K_JVP and ENABLE_V_JVP)
-            )
+            and (not ENABLE_JVP or (ENABLE_Q_JVP and ENABLE_K_JVP and ENABLE_V_JVP))
         ):
             # NOTE: On Hopper, we cannot perform a FP8 dot with a non-transposed second tensor.
             y_dim = Z_H * Q_LEN
@@ -3255,9 +3194,7 @@ class JVPAttn(Function):
             else:
                 v_shape = [y_dim, HEAD_DIM_K]
                 v_strides = [HEAD_DIM_K, 1]
-            desc_v = TensorDescriptor(
-                v, shape=v_shape, strides=v_strides, block_shape=tma_block_shape
-            )
+            desc_v = TensorDescriptor(v, shape=v_shape, strides=v_strides, block_shape=tma_block_shape)
             # NOTE: Probably we could share the shape and strides from above, but whatever
             if q_t is not None and q_t.dtype == torch.float8_e5m2:
                 t_v_shape = [HEAD_DIM_K, y_dim]
@@ -3269,7 +3206,10 @@ class JVPAttn(Function):
                 desc_v
                 if v_t is None
                 else TensorDescriptor(
-                    v_t, shape=t_v_shape, strides=t_v_strides, block_shape=tma_block_shape
+                    v_t,
+                    shape=t_v_shape,
+                    strides=t_v_strides,
+                    block_shape=tma_block_shape,
                 )
             )
 
@@ -3410,12 +3350,15 @@ class JVPAttn(Function):
         causal = inputs[8]
         block_mask = inputs[13]
 
-        o, (
-            o_t,
-            M,
-            sm_scale,
-            mask_tensor,
-            MASK_TYPE,
+        (
+            o,
+            (
+                o_t,
+                M,
+                sm_scale,
+                mask_tensor,
+                MASK_TYPE,
+            ),
         ) = outputs
 
         ctx.save_for_forward(o_t)
@@ -3570,12 +3513,15 @@ class JVPAttn(Function):
             v_t = torch.zeros_like(v_p) if v_t is None else v_t
 
         if _is_compiling() and any(tangent is not None for tangent in (q_t, k_t, v_t)):
-            o, (
-                o_t,
-                _,
-                _,
-                _,
-                _,
+            (
+                o,
+                (
+                    o_t,
+                    _,
+                    _,
+                    _,
+                    _,
+                ),
             ) = JVPAttn.forward(
                 q_p,
                 k_p,
@@ -3665,9 +3611,7 @@ class JVPAttn(Function):
             return x
 
         # Ensure inputs/outputs the kernel reads share the same (contiguous) layout
-        if not (
-            q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and o.is_contiguous()
-        ):
+        if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous() and o.is_contiguous()):
             raise ValueError(
                 "JVPAttn expected q, k, v, o to be contiguous; got "
                 f"q.is_contiguous()={q.is_contiguous()}, k.is_contiguous()={k.is_contiguous()}, "

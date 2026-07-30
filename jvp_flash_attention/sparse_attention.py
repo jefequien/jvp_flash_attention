@@ -61,12 +61,7 @@ def _sparse_fwd_tile(
 
     qk = tl.dot(q, k)
     if ENABLE_JVP:
-        tangent_k = tl.load(
-            TangentK
-            + tangent_k_offset
-            + offs_d[:, None] * stride_tkk
-            + offs_n[None, :] * stride_tkn
-        )
+        tangent_k = tl.load(TangentK + tangent_k_offset + offs_d[:, None] * stride_tkk + offs_n[None, :] * stride_tkn)
         tangent_qk = tl.dot(tangent_q, k) + tl.dot(q, tangent_k)
 
     scaled_qk = qk * qk_scale
@@ -102,15 +97,8 @@ def _sparse_fwd_tile(
         tangent_acc *= alpha[:, None]
         tangent_acc = tl.dot(tangent_probabilities.to(tl.float32), v.to(tl.float32), tangent_acc)
         tangent_mass = tangent_mass * alpha + tl.sum(tangent_probabilities, axis=1)
-        tangent_v = tl.load(
-            TangentV
-            + tangent_v_offset
-            + offs_n[:, None] * stride_tvk
-            + offs_d[None, :] * stride_tvn
-        )
-        tangent_value_acc = tangent_value_acc * alpha[:, None] + tl.dot(
-            probabilities_for_dot, tangent_v.to(tl.float32)
-        )
+        tangent_v = tl.load(TangentV + tangent_v_offset + offs_n[:, None] * stride_tvk + offs_d[None, :] * stride_tvn)
+        tangent_value_acc = tangent_value_acc * alpha[:, None] + tl.dot(probabilities_for_dot, tangent_v.to(tl.float32))
 
     acc = tl.dot(probabilities_for_dot, v.to(tl.float32), acc)
     return acc, tangent_acc, l_i, m_ij, tangent_mass, tangent_value_acc
@@ -182,9 +170,7 @@ def _sparse_fwd_tile_tma(
         tangent_acc = tl.dot(tangent_probabilities.to(tl.float32), v.to(tl.float32), tangent_acc)
         tangent_mass = tangent_mass * alpha + tl.sum(tangent_probabilities, axis=1)
         tangent_v = desc_tangent_v.load([kv_offset, 0])
-        tangent_value_acc = tangent_value_acc * alpha[:, None] + tl.dot(
-            probabilities_for_dot, tangent_v.to(tl.float32)
-        )
+        tangent_value_acc = tangent_value_acc * alpha[:, None] + tl.dot(probabilities_for_dot, tangent_v.to(tl.float32))
 
     acc = tl.dot(probabilities_for_dot, v.to(tl.float32), acc)
     return acc, tangent_acc, l_i, m_ij, tangent_mass, tangent_value_acc
@@ -241,8 +227,8 @@ def _attn_fwd_sparse(
     stride_tom,
     stride_tod,
     H: tl.constexpr,
-    N_CTX: tl.constexpr,
-    N_BLOCKS: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    Q_BLOCKS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     MASK_BATCH: tl.constexpr,
     MASK_HEADS: tl.constexpr,
@@ -274,12 +260,7 @@ def _attn_fwd_sparse(
     m_i = tl.full((_TRITON_BLOCK_SIZE,), -float("inf"), tl.float32)
 
     if ENABLE_JVP:
-        tangent_q = tl.load(
-            TangentQ
-            + tangent_q_offset
-            + offs_m[:, None] * stride_tqm
-            + offs_d[None, :] * stride_tqd
-        )
+        tangent_q = tl.load(TangentQ + tangent_q_offset + offs_m[:, None] * stride_tqm + offs_d[None, :] * stride_tqd)
         tangent_acc = tl.zeros((_TRITON_BLOCK_SIZE, HEAD_DIM), tl.float32)
         tangent_mass = tl.zeros((_TRITON_BLOCK_SIZE,), tl.float32)
         tangent_value_acc = tl.zeros((_TRITON_BLOCK_SIZE, HEAD_DIM), tl.float32)
@@ -289,7 +270,7 @@ def _attn_fwd_sparse(
         tangent_mass = tl.zeros((1,), tl.float32)
         tangent_value_acc = tl.zeros((1, 1), tl.float32)
 
-    metadata_row = (mask_batch_idx * MASK_HEADS + mask_head_idx) * N_BLOCKS + query_block
+    metadata_row = (mask_batch_idx * MASK_HEADS + mask_head_idx) * Q_BLOCKS + query_block
     qk_scale = sm_scale * 1.4426950408889634
 
     full_count = tl.load(FullKVNumBlocks + metadata_row)
@@ -392,21 +373,14 @@ def _attn_fwd_sparse(
         Out + output_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od,
         acc,
     )
-    tl.store(M + batch_head * N_CTX + offs_m, m_i)
+    tl.store(M + batch_head * Q_LEN + offs_m, m_i)
 
     if ENABLE_JVP:
-        tangent_probability_value = (
-            tangent_acc / l_i[:, None] - (tangent_mass / l_i)[:, None] * acc
-        )
+        tangent_probability_value = tangent_acc / l_i[:, None] - (tangent_mass / l_i)[:, None] * acc
         tangent_output = tangent_probability_value + tangent_value_acc / l_i[:, None]
-        tangent_output_offset = (
-            batch_idx.to(tl.int64) * stride_toz + head_idx.to(tl.int64) * stride_toh
-        )
+        tangent_output_offset = batch_idx.to(tl.int64) * stride_toz + head_idx.to(tl.int64) * stride_toh
         tl.store(
-            TangentOut
-            + tangent_output_offset
-            + offs_m[:, None] * stride_tom
-            + offs_d[None, :] * stride_tod,
+            TangentOut + tangent_output_offset + offs_m[:, None] * stride_tom + offs_d[None, :] * stride_tod,
             tangent_output,
         )
 
@@ -543,9 +517,7 @@ def _attn_fwd_sparse_tma(
     offs_m = query_block * _TRITON_BLOCK_SIZE + tl.arange(0, _TRITON_BLOCK_SIZE)
     tl.store(M + batch_head * N_CTX + offs_m, m_i)
     if ENABLE_JVP:
-        tangent_probability_value = (
-            tangent_acc / l_i[:, None] - (tangent_mass / l_i)[:, None] * acc
-        )
+        tangent_probability_value = tangent_acc / l_i[:, None] - (tangent_mass / l_i)[:, None] * acc
         tangent_output = tangent_probability_value + tangent_value_acc / l_i[:, None]
         desc_tangent_out.store([query_offset, 0], tangent_output.to(desc_tangent_out.dtype))
 
@@ -841,6 +813,352 @@ def _attn_bwd_sparse(
     )
 
 
+@triton.jit
+def _sparse_bwd_rect_dkdv_tile(
+    dk,
+    dv,
+    Q,
+    DOut,
+    M,
+    Delta,
+    PartialMasks,
+    q_offset,
+    out_offset,
+    delta_offset,
+    k,
+    v,
+    query_block,
+    mask_id,
+    qk_scale,
+    stride_qm,
+    stride_qd,
+    stride_om,
+    stride_od,
+    HEAD_DIM: tl.constexpr,
+    IS_PARTIAL: tl.constexpr,
+):
+    """Accumulate one rectangular query tile into a fixed dK/dV tile."""
+    offs_m = query_block * _TRITON_BLOCK_SIZE + tl.arange(0, _TRITON_BLOCK_SIZE)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    dout = tl.load(DOut + out_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
+    logsumexp = tl.load(M + delta_offset + offs_m)
+    delta = tl.load(Delta + delta_offset + offs_m)
+
+    score_t = tl.dot(k, tl.trans(q)) * qk_scale - logsumexp[None, :]
+    if IS_PARTIAL:
+        mask_offsets = (
+            mask_id.to(tl.int64) * _TRITON_BLOCK_SIZE * _TRITON_BLOCK_SIZE
+            + tl.arange(0, _TRITON_BLOCK_SIZE)[None, :] * _TRITON_BLOCK_SIZE
+            + tl.arange(0, _TRITON_BLOCK_SIZE)[:, None]
+        )
+        element_mask_t = tl.load(PartialMasks + mask_offsets)
+        score_t = tl.where(element_mask_t, score_t, -float("inf"))
+    probability_t = tl.math.exp2(score_t)
+
+    dv += tl.dot(probability_t.to(tl.float32), dout.to(tl.float32))
+    d_probability_t = tl.dot(v, tl.trans(dout)).to(tl.float32)
+    d_score_t = probability_t * (d_probability_t - delta[None, :])
+    dk += tl.dot(d_score_t.to(tl.float32), q.to(tl.float32))
+    return dk, dv
+
+
+@triton.jit
+def _attn_bwd_sparse_rect_dkdv(
+    Q,
+    K,
+    V,
+    DOut,
+    DK,
+    DV,
+    M,
+    Delta,
+    PartialQNumBlocks,
+    PartialQIndices,
+    PartialQMaskIds,
+    FullQNumBlocks,
+    FullQIndices,
+    PartialMasks,
+    sm_scale,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_od,
+    H: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    KV_BLOCKS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MASK_BATCH: tl.constexpr,
+    MASK_HEADS: tl.constexpr,
+    MAX_PARTIAL_Q: tl.constexpr,
+    MAX_FULL_Q: tl.constexpr,
+):
+    """Rectangular sparse dK/dV with one owner program per K/V tile."""
+    kv_block = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch_idx = batch_head // H
+    head_idx = batch_head % H
+    mask_batch_idx = batch_idx if MASK_BATCH > 1 else 0
+    mask_head_idx = head_idx if MASK_HEADS > 1 else 0
+    metadata_row = (mask_batch_idx * MASK_HEADS + mask_head_idx) * KV_BLOCKS + kv_block
+    q_offset = batch_idx.to(tl.int64) * stride_qz + head_idx.to(tl.int64) * stride_qh
+    k_offset = batch_idx.to(tl.int64) * stride_kz + head_idx.to(tl.int64) * stride_kh
+    v_offset = batch_idx.to(tl.int64) * stride_vz + head_idx.to(tl.int64) * stride_vh
+    out_offset = batch_idx.to(tl.int64) * stride_oz + head_idx.to(tl.int64) * stride_oh
+    delta_offset = batch_head * Q_LEN
+    offs_n = kv_block * _TRITON_BLOCK_SIZE + tl.arange(0, _TRITON_BLOCK_SIZE)
+    offs_d = tl.arange(0, HEAD_DIM)
+    k = tl.load(K + k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd)
+    v = tl.load(V + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd)
+    dk = tl.zeros((_TRITON_BLOCK_SIZE, HEAD_DIM), tl.float32)
+    dv = tl.zeros((_TRITON_BLOCK_SIZE, HEAD_DIM), tl.float32)
+    qk_scale = sm_scale * 1.4426950408889634
+
+    full_q_count = tl.load(FullQNumBlocks + metadata_row)
+    full_q_row_offset = metadata_row.to(tl.int64) * MAX_FULL_Q
+    for entry_idx in range(full_q_count):
+        query_block = tl.load(FullQIndices + full_q_row_offset + entry_idx)
+        dk, dv = _sparse_bwd_rect_dkdv_tile(
+            dk,
+            dv,
+            Q,
+            DOut,
+            M,
+            Delta,
+            PartialMasks,
+            q_offset,
+            out_offset,
+            delta_offset,
+            k,
+            v,
+            query_block,
+            0,
+            qk_scale,
+            stride_qm,
+            stride_qd,
+            stride_om,
+            stride_od,
+            HEAD_DIM,
+            IS_PARTIAL=False,
+        )
+
+    partial_q_count = tl.load(PartialQNumBlocks + metadata_row)
+    partial_q_row_offset = metadata_row.to(tl.int64) * MAX_PARTIAL_Q
+    for entry_idx in range(partial_q_count):
+        query_block = tl.load(PartialQIndices + partial_q_row_offset + entry_idx)
+        mask_id = tl.load(PartialQMaskIds + partial_q_row_offset + entry_idx)
+        dk, dv = _sparse_bwd_rect_dkdv_tile(
+            dk,
+            dv,
+            Q,
+            DOut,
+            M,
+            Delta,
+            PartialMasks,
+            q_offset,
+            out_offset,
+            delta_offset,
+            k,
+            v,
+            query_block,
+            mask_id,
+            qk_scale,
+            stride_qm,
+            stride_qd,
+            stride_om,
+            stride_od,
+            HEAD_DIM,
+            IS_PARTIAL=True,
+        )
+
+    tl.store(
+        DK + k_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+        dk * sm_scale,
+    )
+    tl.store(
+        DV + v_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+        dv,
+    )
+
+
+@triton.jit
+def _sparse_bwd_rect_dq_tile(
+    dq,
+    K,
+    V,
+    PartialMasks,
+    k_offset,
+    v_offset,
+    q,
+    dout,
+    logsumexp,
+    delta,
+    kv_block,
+    mask_id,
+    qk_scale,
+    stride_kn,
+    stride_kd,
+    stride_vn,
+    stride_vd,
+    HEAD_DIM: tl.constexpr,
+    IS_PARTIAL: tl.constexpr,
+):
+    """Accumulate one rectangular K/V tile into a fixed dQ tile."""
+    offs_n = kv_block * _TRITON_BLOCK_SIZE + tl.arange(0, _TRITON_BLOCK_SIZE)
+    offs_d = tl.arange(0, HEAD_DIM)
+    k_t = tl.load(K + k_offset + offs_d[:, None] * stride_kd + offs_n[None, :] * stride_kn)
+    v_t = tl.load(V + v_offset + offs_d[:, None] * stride_vd + offs_n[None, :] * stride_vn)
+    score = tl.dot(q, k_t) * qk_scale - logsumexp[:, None]
+    if IS_PARTIAL:
+        mask_offsets = (
+            mask_id.to(tl.int64) * _TRITON_BLOCK_SIZE * _TRITON_BLOCK_SIZE
+            + tl.arange(0, _TRITON_BLOCK_SIZE)[:, None] * _TRITON_BLOCK_SIZE
+            + tl.arange(0, _TRITON_BLOCK_SIZE)[None, :]
+        )
+        element_mask = tl.load(PartialMasks + mask_offsets)
+        score = tl.where(element_mask, score, -float("inf"))
+    probability = tl.math.exp2(score)
+
+    d_probability = tl.dot(dout, v_t).to(tl.float32)
+    d_score = probability * (d_probability - delta[:, None])
+    dq += tl.dot(d_score.to(tl.float32), tl.trans(k_t).to(tl.float32))
+    return dq
+
+
+@triton.jit
+def _attn_bwd_sparse_rect_dq(
+    Q,
+    K,
+    V,
+    DOut,
+    DQ,
+    M,
+    Delta,
+    PartialKVNumBlocks,
+    PartialKVIndices,
+    PartialKVMaskIds,
+    FullKVNumBlocks,
+    FullKVIndices,
+    PartialMasks,
+    sm_scale,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_od,
+    H: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    Q_BLOCKS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    MASK_BATCH: tl.constexpr,
+    MASK_HEADS: tl.constexpr,
+    MAX_PARTIAL_KV: tl.constexpr,
+    MAX_FULL_KV: tl.constexpr,
+):
+    """Rectangular sparse dQ with one owner program per query tile."""
+    query_block = tl.program_id(0)
+    batch_head = tl.program_id(1)
+    batch_idx = batch_head // H
+    head_idx = batch_head % H
+    mask_batch_idx = batch_idx if MASK_BATCH > 1 else 0
+    mask_head_idx = head_idx if MASK_HEADS > 1 else 0
+    metadata_row = (mask_batch_idx * MASK_HEADS + mask_head_idx) * Q_BLOCKS + query_block
+    q_offset = batch_idx.to(tl.int64) * stride_qz + head_idx.to(tl.int64) * stride_qh
+    k_offset = batch_idx.to(tl.int64) * stride_kz + head_idx.to(tl.int64) * stride_kh
+    v_offset = batch_idx.to(tl.int64) * stride_vz + head_idx.to(tl.int64) * stride_vh
+    out_offset = batch_idx.to(tl.int64) * stride_oz + head_idx.to(tl.int64) * stride_oh
+    delta_offset = batch_head * Q_LEN
+    offs_m = query_block * _TRITON_BLOCK_SIZE + tl.arange(0, _TRITON_BLOCK_SIZE)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd)
+    dout = tl.load(DOut + out_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od)
+    logsumexp = tl.load(M + delta_offset + offs_m)
+    delta = tl.load(Delta + delta_offset + offs_m)
+    dq = tl.zeros((_TRITON_BLOCK_SIZE, HEAD_DIM), tl.float32)
+    qk_scale = sm_scale * 1.4426950408889634
+
+    full_kv_count = tl.load(FullKVNumBlocks + metadata_row)
+    full_kv_row_offset = metadata_row.to(tl.int64) * MAX_FULL_KV
+    for entry_idx in range(full_kv_count):
+        kv_block = tl.load(FullKVIndices + full_kv_row_offset + entry_idx)
+        dq = _sparse_bwd_rect_dq_tile(
+            dq,
+            K,
+            V,
+            PartialMasks,
+            k_offset,
+            v_offset,
+            q,
+            dout,
+            logsumexp,
+            delta,
+            kv_block,
+            0,
+            qk_scale,
+            stride_kn,
+            stride_kd,
+            stride_vn,
+            stride_vd,
+            HEAD_DIM,
+            IS_PARTIAL=False,
+        )
+
+    partial_kv_count = tl.load(PartialKVNumBlocks + metadata_row)
+    partial_kv_row_offset = metadata_row.to(tl.int64) * MAX_PARTIAL_KV
+    for entry_idx in range(partial_kv_count):
+        kv_block = tl.load(PartialKVIndices + partial_kv_row_offset + entry_idx)
+        mask_id = tl.load(PartialKVMaskIds + partial_kv_row_offset + entry_idx)
+        dq = _sparse_bwd_rect_dq_tile(
+            dq,
+            K,
+            V,
+            PartialMasks,
+            k_offset,
+            v_offset,
+            q,
+            dout,
+            logsumexp,
+            delta,
+            kv_block,
+            mask_id,
+            qk_scale,
+            stride_kn,
+            stride_kd,
+            stride_vn,
+            stride_vd,
+            HEAD_DIM,
+            IS_PARTIAL=True,
+        )
+
+    tl.store(
+        DQ + q_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd,
+        dq * sm_scale,
+    )
+
+
 def _strides_4d(tensor: Tensor) -> tuple[int, int, int, int]:
     """Return statically typed strides for a rank-four tensor."""
     return tuple(tensor.stride())  # type: ignore[return-value]
@@ -870,21 +1188,26 @@ def _launch_sparse_forward(
     use_tma: bool,
 ) -> tuple[Tensor, Tensor | None, Tensor]:
     """Allocate outputs and launch the sparse forward kernel."""
-    batch, heads, sequence, head_dim = q.shape
+    batch, heads, query_length, head_dim = q.shape
+    key_value_length = k.shape[2]
     enable_jvp = q_t is not None
     if enable_jvp and (k_t is None or v_t is None):
         raise ValueError("Sparse JVP requires q_t, k_t, and v_t together.")
 
     out = torch.empty_like(q)
     tangent_out = torch.empty_like(q_t) if q_t is not None else None
-    memory = torch.empty((batch, heads, sequence), device=q.device, dtype=torch.float32)
+    memory = torch.empty(
+        (batch, heads, query_length),
+        device=q.device,
+        dtype=torch.float32,
+    )
     tangent_q_arg = q if q_t is None else q_t
     tangent_k_arg = k if k_t is None else k_t
     tangent_v_arg = v if v_t is None else v_t
     tangent_out_arg = out if tangent_out is None else tangent_out
 
-    grid = (sequence // BLOCK_SIZE, batch * heads)
-    tma_enabled = use_tma and supports_sparse_tma(q.device)
+    grid = (query_length // BLOCK_SIZE, batch * heads)
+    tma_enabled = use_tma and query_length == key_value_length and supports_sparse_tma(q.device)
     launch_options: dict[str, int] = {
         "num_warps": 4,
         "num_stages": 1 if head_dim >= 128 else 2,
@@ -904,8 +1227,6 @@ def _launch_sparse_forward(
 
     common_meta = {
         "H": heads,
-        "N_CTX": sequence,
-        "N_BLOCKS": sequence // BLOCK_SIZE,
         "HEAD_DIM": head_dim,
         "MASK_BATCH": block_mask.mask_batch_size,
         "MASK_HEADS": block_mask.mask_heads,
@@ -915,7 +1236,7 @@ def _launch_sparse_forward(
     }
     if tma_enabled:
         assert TensorDescriptor is not None
-        descriptor_shape = [batch * heads * sequence, head_dim]
+        descriptor_shape = [batch * heads * query_length, head_dim]
         descriptor_strides = [head_dim, 1]
         descriptor_block = [BLOCK_SIZE, head_dim]
 
@@ -944,6 +1265,8 @@ def _launch_sparse_forward(
             block_mask.full_kv_num_blocks,
             block_mask.full_kv_indices,
             block_mask.partial_masks,
+            N_CTX=query_length,
+            N_BLOCKS=query_length // BLOCK_SIZE,
             **common_meta,
             **launch_options,
         )
@@ -974,6 +1297,8 @@ def _launch_sparse_forward(
         *_strides_4d(tangent_v_arg),
         *_strides_4d(out),
         *_strides_4d(tangent_out_arg),
+        Q_LEN=query_length,
+        Q_BLOCKS=query_length // BLOCK_SIZE,
         **common_meta,
         **launch_options,
     )
@@ -991,42 +1316,75 @@ def sparse_attention_backward(
     sm_scale: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Launch sparse primal reverse mode for dQ, dK, and dV."""
-    batch, heads, sequence, head_dim = q.shape
+    batch, heads, query_length, head_dim = q.shape
+    key_value_length = k.shape[2]
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     delta = torch.empty_like(memory)
 
-    grid = (sequence // BLOCK_SIZE, batch * heads)
+    query_grid = (query_length // BLOCK_SIZE, batch * heads)
     launch_options: dict[str, int] = {"num_warps": 4, "num_stages": 2}
-    if (
-        q.is_cuda
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability(q.device)[0] >= 10
-    ):
+    if q.is_cuda and torch.version.cuda is not None and torch.cuda.get_device_capability(q.device)[0] >= 10:
         launch_options["maxnreg"] = 168
 
-    _sparse_bwd_preprocess[grid](
+    _sparse_bwd_preprocess[query_grid](
         out,
         dout,
         delta,
-        N_CTX=sequence,
+        N_CTX=query_length,
         HEAD_DIM=head_dim,
         num_warps=4,
     )
-    _attn_bwd_sparse[grid](
+    if query_length == key_value_length:
+        _attn_bwd_sparse[query_grid](
+            q,
+            k,
+            v,
+            dout,
+            dq,
+            dk,
+            dv,
+            memory,
+            delta,
+            block_mask.partial_kv_num_blocks,
+            block_mask.partial_kv_indices,
+            block_mask.partial_kv_mask_ids,
+            block_mask.full_kv_num_blocks,
+            block_mask.full_kv_indices,
+            block_mask.partial_q_num_blocks,
+            block_mask.partial_q_indices,
+            block_mask.partial_q_mask_ids,
+            block_mask.full_q_num_blocks,
+            block_mask.full_q_indices,
+            block_mask.partial_masks,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            H=heads,
+            N_CTX=query_length,
+            N_BLOCKS=query_length // BLOCK_SIZE,
+            HEAD_DIM=head_dim,
+            MASK_BATCH=block_mask.mask_batch_size,
+            MASK_HEADS=block_mask.mask_heads,
+            MAX_PARTIAL_KV=block_mask.partial_kv_indices.shape[-1],
+            MAX_FULL_KV=block_mask.full_kv_indices.shape[-1],
+            MAX_PARTIAL_Q=block_mask.partial_q_indices.shape[-1],
+            MAX_FULL_Q=block_mask.full_q_indices.shape[-1],
+            **launch_options,
+        )
+        return dq, dk, dv
+
+    key_value_grid = (key_value_length // BLOCK_SIZE, batch * heads)
+    _attn_bwd_sparse_rect_dkdv[key_value_grid](
         q,
         k,
         v,
         dout,
-        dq,
         dk,
         dv,
         memory,
         delta,
-        block_mask.partial_kv_num_blocks,
-        block_mask.partial_kv_indices,
-        block_mask.partial_kv_mask_ids,
-        block_mask.full_kv_num_blocks,
-        block_mask.full_kv_indices,
         block_mask.partial_q_num_blocks,
         block_mask.partial_q_indices,
         block_mask.partial_q_mask_ids,
@@ -1034,20 +1392,47 @@ def sparse_attention_backward(
         block_mask.full_q_indices,
         block_mask.partial_masks,
         sm_scale,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
+        *_strides_4d(q),
+        *_strides_4d(k),
+        *_strides_4d(v),
+        *_strides_4d(dout),
         H=heads,
-        N_CTX=sequence,
-        N_BLOCKS=sequence // BLOCK_SIZE,
+        Q_LEN=query_length,
+        KV_BLOCKS=key_value_length // BLOCK_SIZE,
+        HEAD_DIM=head_dim,
+        MASK_BATCH=block_mask.mask_batch_size,
+        MASK_HEADS=block_mask.mask_heads,
+        MAX_PARTIAL_Q=block_mask.partial_q_indices.shape[-1],
+        MAX_FULL_Q=block_mask.full_q_indices.shape[-1],
+        **launch_options,
+    )
+    _attn_bwd_sparse_rect_dq[query_grid](
+        q,
+        k,
+        v,
+        dout,
+        dq,
+        memory,
+        delta,
+        block_mask.partial_kv_num_blocks,
+        block_mask.partial_kv_indices,
+        block_mask.partial_kv_mask_ids,
+        block_mask.full_kv_num_blocks,
+        block_mask.full_kv_indices,
+        block_mask.partial_masks,
+        sm_scale,
+        *_strides_4d(q),
+        *_strides_4d(k),
+        *_strides_4d(v),
+        *_strides_4d(dout),
+        H=heads,
+        Q_LEN=query_length,
+        Q_BLOCKS=query_length // BLOCK_SIZE,
         HEAD_DIM=head_dim,
         MASK_BATCH=block_mask.mask_batch_size,
         MASK_HEADS=block_mask.mask_heads,
         MAX_PARTIAL_KV=block_mask.partial_kv_indices.shape[-1],
         MAX_FULL_KV=block_mask.full_kv_indices.shape[-1],
-        MAX_PARTIAL_Q=block_mask.partial_q_indices.shape[-1],
-        MAX_FULL_Q=block_mask.full_q_indices.shape[-1],
         **launch_options,
     )
     return dq, dk, dv
@@ -1055,6 +1440,7 @@ def sparse_attention_backward(
 
 def _rebuild_block_mask(
     q: Tensor,
+    k: Tensor,
     metadata: list[Tensor] | tuple[Tensor, ...],
 ) -> BlockSparseMask:
     """Rebuild the lightweight Python wrapper around compiled-op tensor inputs."""
@@ -1063,6 +1449,8 @@ def _rebuild_block_mask(
         q.shape[2],
         BLOCK_SIZE,
         metadata,
+        k.shape[2],
+        k.shape[2],
     )
 
 
@@ -1082,6 +1470,7 @@ def _attn_fwd_sparse_triton(
     """Opaque sparse primal/JVP launch for ``torch.compile``."""
     block_mask = _rebuild_block_mask(
         q,
+        k,
         metadata,
     )
     out, tangent_out, memory = _launch_sparse_forward(
@@ -1135,6 +1524,7 @@ def _attn_bwd_sparse_triton(
     """Opaque sparse reverse launch used by compiled autograd."""
     block_mask = _rebuild_block_mask(
         q,
+        k,
         metadata,
     )
     return sparse_attention_backward(

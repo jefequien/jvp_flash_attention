@@ -48,6 +48,28 @@ def _mixed_mask(length: int, *, device: str = "cuda") -> Tensor:
     return mask
 
 
+def _rectangular_mask(
+    query_length: int,
+    key_value_length: int,
+    *,
+    device: str = "cuda",
+) -> Tensor:
+    generator = torch.Generator(device=device).manual_seed(456)
+    mask = (
+        torch.rand(
+            query_length,
+            key_value_length,
+            generator=generator,
+            device=device,
+        )
+        > 0.82
+    )
+    mask[:, :16] = True
+    if query_length >= 32 and key_value_length >= 64:
+        mask[:32, 32:64] = True
+    return mask
+
+
 def _inputs(
     *,
     batch: int = 1,
@@ -70,6 +92,37 @@ def _inputs(
     )
 
 
+def _rectangular_inputs(
+    *,
+    batch: int = 1,
+    heads: int = 2,
+    query_length: int = 53,
+    key_value_length: int = 77,
+    head_dim: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[Tensor, ...]:
+    torch.manual_seed(654)
+
+    def make(length: int) -> Tensor:
+        return torch.randn(
+            batch,
+            heads,
+            length,
+            head_dim,
+            device="cuda",
+            dtype=dtype,
+        )
+
+    return (
+        make(query_length),
+        make(key_value_length),
+        make(key_value_length),
+        make(query_length),
+        make(key_value_length),
+        make(key_value_length),
+    )
+
+
 @pytest.mark.parametrize("use_tma", [False, True])
 def test_sparse_primal_jvp_and_backward(use_tma: bool) -> None:
     mask = _mixed_mask(53)
@@ -79,9 +132,7 @@ def test_sparse_primal_jvp_and_backward(use_tma: bool) -> None:
     if use_tma and not supports_sparse_tma(q.device):
         pytest.skip("The explicit block_sparse_tma implementation is unavailable")
     implementation = (
-        AttentionImplementation.BLOCK_SPARSE_TMA
-        if use_tma
-        else AttentionImplementation.BLOCK_SPARSE_POINTER
+        AttentionImplementation.BLOCK_SPARSE_TMA if use_tma else AttentionImplementation.BLOCK_SPARSE_POINTER
     )
 
     q.requires_grad_()
@@ -109,12 +160,9 @@ def test_sparse_primal_jvp_and_backward(use_tma: bool) -> None:
         (tangent_q, tangent_k, tangent_v),
     )
     pad_tokens = block_mask.padded_length - mask.shape[-1]
-    dense_primals = tuple(
-        torch.nn.functional.pad(tensor, (0, 0, 0, pad_tokens)) for tensor in (q, k, v)
-    )
+    dense_primals = tuple(torch.nn.functional.pad(tensor, (0, 0, 0, pad_tokens)) for tensor in (q, k, v))
     dense_tangents = tuple(
-        torch.nn.functional.pad(tensor, (0, 0, 0, pad_tokens))
-        for tensor in (tangent_q, tangent_k, tangent_v)
+        torch.nn.functional.pad(tensor, (0, 0, 0, pad_tokens)) for tensor in (tangent_q, tangent_k, tangent_v)
     )
     dense_primal, dense_tangent = torch.func.jvp(
         lambda a, b, c: JVPAttn.fwd_dual(
@@ -150,6 +198,114 @@ def test_sparse_primal_jvp_and_backward(use_tma: bool) -> None:
     )
     for actual, expected in zip(actual_grads, reference_grads, strict=True):
         torch.testing.assert_close(actual, expected, atol=1.5e-2, rtol=2e-2)
+
+
+def test_rectangular_sparse_primal_jvp_and_backward() -> None:
+    query_length, key_value_length = 53, 77
+    mask = _rectangular_mask(query_length, key_value_length)
+    block_mask = BlockSparseMask.from_bool(mask)
+    q, k, v, tangent_q, tangent_k, tangent_v = _rectangular_inputs(
+        query_length=query_length,
+        key_value_length=key_value_length,
+    )
+    scale = 0.2
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+
+    def sparse(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
+        return flash_attention(
+            a,
+            b,
+            c,
+            implementation=AttentionImplementation.BLOCK_SPARSE_POINTER,
+            block_mask=block_mask,
+            sm_scale=scale,
+        )
+
+    primal, tangent = torch.func.jvp(
+        sparse,
+        (q, k, v),
+        (tangent_q, tangent_k, tangent_v),
+    )
+    reference_primal, reference_tangent = torch.func.jvp(
+        lambda a, b, c: _explicit_attention(a, b, c, mask, scale=scale),
+        (q, k, v),
+        (tangent_q, tangent_k, tangent_v),
+    )
+    torch.testing.assert_close(
+        primal.float(),
+        reference_primal,
+        atol=1.5e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        tangent.float(),
+        reference_tangent,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+
+    output_cotangent = torch.randn_like(primal)
+    (primal * output_cotangent).sum().backward()
+    actual_grads = (q.grad.float(), k.grad.float(), v.grad.float())
+    reference_inputs = tuple(tensor.detach().float().requires_grad_() for tensor in (q, k, v))
+    reference_output = _explicit_attention(
+        *reference_inputs,
+        mask,
+        scale=scale,
+    )
+    reference_grads = torch.autograd.grad(
+        reference_output,
+        reference_inputs,
+        output_cotangent.float(),
+    )
+    for actual, expected in zip(actual_grads, reference_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=1.5e-2, rtol=2e-2)
+
+
+def test_compiled_rectangular_sparse_jvp_and_backward() -> None:
+    query_length, key_value_length = 64, 96
+    mask = _rectangular_mask(query_length, key_value_length)
+    block_mask = BlockSparseMask.from_bool(mask)
+    inputs = _rectangular_inputs(
+        heads=1,
+        query_length=query_length,
+        key_value_length=key_value_length,
+        head_dim=32,
+    )
+
+    def fused_dual(*args: Tensor) -> tuple[Tensor, Tensor]:
+        def sparse(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
+            return JVPAttn.fwd_dual(
+                a,
+                b,
+                c,
+                block_mask=block_mask,
+                USE_TMA=False,
+            )
+
+        return torch.func.jvp(sparse, args[:3], args[3:])
+
+    def run(function, primals):
+        primal, tangent = function(*primals, *inputs[3:])
+        loss = (primal.float() + 0.2 * tangent.detach().float()).square().mean()
+        gradients = torch.autograd.grad(loss, primals)
+        return primal, tangent, loss, gradients
+
+    eager_primals = tuple(tensor.detach().requires_grad_() for tensor in inputs[:3])
+    expected = run(fused_dual, eager_primals)
+    compiled_primals = tuple(tensor.detach().requires_grad_() for tensor in inputs[:3])
+    actual = run(torch.compile(fused_dual, fullgraph=True), compiled_primals)
+
+    for actual_tensor, expected_tensor in zip(actual[:3], expected[:3], strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+    for actual_gradient, expected_gradient in zip(
+        actual[3],
+        expected[3],
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
 
 
 def test_direct_dual_matches_torch_func_jvp() -> None:
@@ -402,9 +558,7 @@ def test_sparse_mask_batch_head_broadcast(
         reference_inputs,
         cotangent.float(),
     )
-    for actual_gradient, reference_gradient in zip(
-        actual_gradients, reference_gradients, strict=True
-    ):
+    for actual_gradient, reference_gradient in zip(actual_gradients, reference_gradients, strict=True):
         torch.testing.assert_close(
             actual_gradient.float(),
             reference_gradient,
@@ -532,12 +686,8 @@ def test_float32_jvp_matches_central_difference() -> None:
     # Triton's float32 tensor-core dot uses TF32 on NVIDIA. A moderately sized
     # step avoids measuring TF32 quantization noise instead of the derivative.
     epsilon = 2e-2
-    plus = attention(
-        *(primal + epsilon * direction for primal, direction in zip(primals, tangents))
-    )
-    minus = attention(
-        *(primal - epsilon * direction for primal, direction in zip(primals, tangents))
-    )
+    plus = attention(*(primal + epsilon * direction for primal, direction in zip(primals, tangents)))
+    minus = attention(*(primal - epsilon * direction for primal, direction in zip(primals, tangents)))
     finite_difference = (plus - minus) / (2 * epsilon)
     torch.testing.assert_close(tangent, finite_difference, atol=3e-2, rtol=3e-2)
 

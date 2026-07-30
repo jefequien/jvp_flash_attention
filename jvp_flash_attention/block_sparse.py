@@ -45,21 +45,12 @@ def _make_schedule(
     n_blocks = len(rows[0][0])
     max_blocks = max(
         1,
-        max(
-            len(rows[b][h][row])
-            for b in range(batch)
-            for h in range(heads)
-            for row in range(n_blocks)
-        ),
+        max(len(rows[b][h][row]) for b in range(batch) for h in range(heads) for row in range(n_blocks)),
     )
 
     counts = torch.zeros((batch, heads, n_blocks), dtype=torch.int32)
     indices = torch.zeros((batch, heads, n_blocks, max_blocks), dtype=torch.int32)
-    mask_ids = (
-        torch.zeros((batch, heads, n_blocks, max_blocks), dtype=torch.int32)
-        if with_mask_ids
-        else None
-    )
+    mask_ids = torch.zeros((batch, heads, n_blocks, max_blocks), dtype=torch.int32) if with_mask_ids else None
 
     for batch_idx in range(batch):
         for head_idx in range(heads):
@@ -99,6 +90,10 @@ class BlockSparseMask:
     Mask batch and head dimensions may be one, meaning that the schedule is
     broadcast across the corresponding Q/K/V dimension. Construct masks with
     ``from_bool`` and treat the tensor fields as immutable metadata.
+
+    ``original_length`` and ``padded_length`` retain their historical names and
+    describe the query dimension. The optional K/V lengths differ only for
+    rectangular attention.
     """
 
     original_length: int
@@ -118,6 +113,8 @@ class BlockSparseMask:
     full_q_indices: Tensor
 
     partial_masks: Tensor
+    original_kv_length: int | None = None
+    padded_kv_length: int | None = None
 
     def _tensor_values(self) -> list[Tensor]:
         """Return tensor fields in their stable pytree order."""
@@ -130,19 +127,28 @@ class BlockSparseMask:
         padded_length: int,
         block_size: int,
         tensors: list[Tensor] | tuple[Tensor, ...],
+        original_kv_length: int | None = None,
+        padded_kv_length: int | None = None,
     ) -> BlockSparseMask:
         """Rebuild a mask from its scalar metadata and pytree tensor leaves."""
         if len(tensors) != len(_TENSOR_FIELDS):
             raise ValueError(f"Expected {len(_TENSOR_FIELDS)} mask tensors, got {len(tensors)}.")
-        return cls(original_length, padded_length, block_size, *tensors)
+        return cls(
+            original_length,
+            padded_length,
+            block_size,
+            *tensors,
+            original_kv_length=original_kv_length,
+            padded_kv_length=padded_kv_length,
+        )
 
     @classmethod
     def from_bool(cls, mask: Tensor, *, block_size: int = 32) -> BlockSparseMask:
-        """Compress a square Boolean mask into sparse tile schedules.
+        """Compress a Boolean mask into sparse tile schedules.
 
-        ``mask`` may have shape ``[sequence, sequence]`` or
-        ``[mask_batch, mask_heads, sequence, sequence]``. A mask dimension of
-        one is broadcast when the mask is used.
+        ``mask`` may have shape ``[query, key_value]`` or
+        ``[mask_batch, mask_heads, query, key_value]``. A mask batch or head
+        dimension of one is broadcast when the mask is used.
         """
         if block_size != 32:
             raise ValueError(f"Only block_size=32 is currently supported, got {block_size}.")
@@ -152,17 +158,15 @@ class BlockSparseMask:
             mask = mask[None, None]
         elif mask.ndim != 4:
             raise ValueError(
-                "BlockSparseMask expects [N, N] or [mask_batch, mask_heads, N, N], "
-                f"got shape {tuple(mask.shape)}."
+                f"BlockSparseMask expects [Q, KV] or [mask_batch, mask_heads, Q, KV], got shape {tuple(mask.shape)}."
             )
-        if mask.shape[-2] != mask.shape[-1]:
-            raise ValueError(f"BlockSparseMask requires a square mask, got {tuple(mask.shape)}.")
         if mask.shape[0] == 0 or mask.shape[1] == 0:
             raise ValueError("BlockSparseMask batch and head dimensions must be non-empty.")
 
-        original_length = mask.shape[-1]
-        if original_length == 0:
-            raise ValueError("BlockSparseMask requires a non-empty sequence.")
+        original_length = mask.shape[-2]
+        original_kv_length = mask.shape[-1]
+        if original_length == 0 or original_kv_length == 0:
+            raise ValueError("BlockSparseMask requires non-empty query and key dimensions.")
         device = mask.device
         mask = mask.detach().cpu()
         if not bool(mask.any(dim=-1).all()):
@@ -170,40 +174,55 @@ class BlockSparseMask:
 
         batch, heads = mask.shape[:2]
         padded_length = ((original_length + block_size - 1) // block_size) * block_size
-        n_blocks = padded_length // block_size
+        padded_kv_length = ((original_kv_length + block_size - 1) // block_size) * block_size
+        query_blocks = padded_length // block_size
+        kv_blocks = padded_kv_length // block_size
 
         # This dense tensor is temporary construction workspace only. The
         # compressed object returned below does not retain it.
         padded = torch.zeros(
-            (batch, heads, padded_length, padded_length),
+            (batch, heads, padded_length, padded_kv_length),
             dtype=torch.bool,
         )
-        padded[..., :original_length, :original_length] = mask
+        padded[..., :original_length, :original_kv_length] = mask
         if padded_length != original_length:
-            pad_indices = torch.arange(original_length, padded_length)
-            padded[..., pad_indices, pad_indices] = True
+            if original_length == original_kv_length:
+                pad_indices = torch.arange(original_length, padded_length)
+                padded[..., pad_indices, pad_indices] = True
+            else:
+                # Padded query rows are discarded after attention. Giving them
+                # one real key keeps the online softmax finite without exposing
+                # padded keys to any real query.
+                padded[..., original_length:, 0] = True
 
         tiles = (
-            padded.reshape(batch, heads, n_blocks, block_size, n_blocks, block_size)
+            padded.reshape(
+                batch,
+                heads,
+                query_blocks,
+                block_size,
+                kv_blocks,
+                block_size,
+            )
             .permute(0, 1, 2, 4, 3, 5)
             .contiguous()
         )
         any_tiles = tiles.any(dim=(-1, -2))
         full_tiles = tiles.all(dim=(-1, -2))
 
-        def empty_rows() -> list[list[list[list[Any]]]]:
-            return [[[[] for _ in range(n_blocks)] for _ in range(heads)] for _ in range(batch)]
+        def empty_rows(count: int) -> list[list[list[list[Any]]]]:
+            return [[[[] for _ in range(count)] for _ in range(heads)] for _ in range(batch)]
 
-        partial_kv = empty_rows()
-        full_kv = empty_rows()
-        partial_q = empty_rows()
-        full_q = empty_rows()
+        partial_kv = empty_rows(query_blocks)
+        full_kv = empty_rows(query_blocks)
+        partial_q = empty_rows(kv_blocks)
+        full_q = empty_rows(kv_blocks)
         partial_payloads: list[Tensor] = []
 
         for batch_idx in range(batch):
             for head_idx in range(heads):
-                for query_block in range(n_blocks):
-                    for kv_block in range(n_blocks):
+                for query_block in range(query_blocks):
+                    for kv_block in range(kv_blocks):
                         if not bool(any_tiles[batch_idx, head_idx, query_block, kv_block]):
                             continue
                         if bool(full_tiles[batch_idx, head_idx, query_block, kv_block]):
@@ -211,12 +230,8 @@ class BlockSparseMask:
                             full_q[batch_idx][head_idx][kv_block].append(query_block)
                         else:
                             mask_id = len(partial_payloads)
-                            partial_payloads.append(
-                                tiles[batch_idx, head_idx, query_block, kv_block].clone()
-                            )
-                            partial_kv[batch_idx][head_idx][query_block].append(
-                                (kv_block, mask_id)
-                            )
+                            partial_payloads.append(tiles[batch_idx, head_idx, query_block, kv_block].clone())
+                            partial_kv[batch_idx][head_idx][query_block].append((kv_block, mask_id))
                             partial_q[batch_idx][head_idx][kv_block].append((query_block, mask_id))
 
         (
@@ -256,6 +271,8 @@ class BlockSparseMask:
             full_q_num_blocks=full_q_num_blocks,
             full_q_indices=full_q_indices,
             partial_masks=partial_masks,
+            original_kv_length=original_kv_length,
+            padded_kv_length=padded_kv_length,
         )
         result.validate()
         return result if device.type == "cpu" else result.to(device)
@@ -276,9 +293,43 @@ class BlockSparseMask:
         return self.partial_kv_num_blocks.shape[1]
 
     @property
+    def query_length(self) -> int:
+        """Return the unpadded query length."""
+        return self.original_length
+
+    @property
+    def kv_length(self) -> int:
+        """Return the unpadded key/value length."""
+        return self.original_length if self.original_kv_length is None else self.original_kv_length
+
+    @property
+    def padded_query_length(self) -> int:
+        """Return the query length rounded up to complete sparse tiles."""
+        return self.padded_length
+
+    @property
+    def padded_key_value_length(self) -> int:
+        """Return the key/value length rounded up to complete sparse tiles."""
+        return self.padded_length if self.padded_kv_length is None else self.padded_kv_length
+
+    @property
+    def num_query_blocks(self) -> int:
+        """Return the number of padded query tiles."""
+        return self.padded_query_length // self.block_size
+
+    @property
+    def num_kv_blocks(self) -> int:
+        """Return the number of padded key/value tiles."""
+        return self.padded_key_value_length // self.block_size
+
+    @property
     def num_blocks(self) -> int:
-        """Return the number of padded query and key tiles."""
-        return self.padded_length // self.block_size
+        """Return the sparse schedule capacity in tiles.
+
+        This remains equal to the historical square tile count for square
+        masks. Rectangular callers use it as a conservative fixed capacity.
+        """
+        return max(self.num_query_blocks, self.num_kv_blocks)
 
     @property
     def num_partial_tiles(self) -> int:
@@ -293,10 +344,7 @@ class BlockSparseMask:
     @property
     def storage_bytes(self) -> int:
         """Return storage occupied by tensor metadata and partial payloads."""
-        return sum(
-            getattr(self, name).numel() * getattr(self, name).element_size()
-            for name in _TENSOR_FIELDS
-        )
+        return sum(getattr(self, name).numel() * getattr(self, name).element_size() for name in _TENSOR_FIELDS)
 
     def pad_to_capacity(
         self,
@@ -317,34 +365,20 @@ class BlockSparseMask:
         )
         minimum_schedule_width = max(tensor.shape[-1] for tensor in schedule_tensors)
         if schedule_width < minimum_schedule_width:
-            raise ValueError(
-                f"schedule_width must be at least {minimum_schedule_width}, "
-                f"got {schedule_width}."
-            )
+            raise ValueError(f"schedule_width must be at least {minimum_schedule_width}, got {schedule_width}.")
         if partial_mask_count < self.partial_masks.shape[0]:
             raise ValueError(
-                f"partial_mask_count must be at least {self.partial_masks.shape[0]}, "
-                f"got {partial_mask_count}."
+                f"partial_mask_count must be at least {self.partial_masks.shape[0]}, got {partial_mask_count}."
             )
         result = replace(
             self,
-            partial_kv_indices=_pad_last_dimension(
-                self.partial_kv_indices, schedule_width
-            ),
-            partial_kv_mask_ids=_pad_last_dimension(
-                self.partial_kv_mask_ids, schedule_width
-            ),
+            partial_kv_indices=_pad_last_dimension(self.partial_kv_indices, schedule_width),
+            partial_kv_mask_ids=_pad_last_dimension(self.partial_kv_mask_ids, schedule_width),
             full_kv_indices=_pad_last_dimension(self.full_kv_indices, schedule_width),
-            partial_q_indices=_pad_last_dimension(
-                self.partial_q_indices, schedule_width
-            ),
-            partial_q_mask_ids=_pad_last_dimension(
-                self.partial_q_mask_ids, schedule_width
-            ),
+            partial_q_indices=_pad_last_dimension(self.partial_q_indices, schedule_width),
+            partial_q_mask_ids=_pad_last_dimension(self.partial_q_mask_ids, schedule_width),
             full_q_indices=_pad_last_dimension(self.full_q_indices, schedule_width),
-            partial_masks=_pad_first_dimension(
-                self.partial_masks, partial_mask_count
-            ),
+            partial_masks=_pad_first_dimension(self.partial_masks, partial_mask_count),
         )
         result.validate()
         return result
@@ -352,20 +386,25 @@ class BlockSparseMask:
     @property
     def tile_density(self) -> float:
         """Return the fraction of full or partial tiles in the padded grid."""
-        denominator = self.mask_batch_size * self.mask_heads * self.num_blocks**2
+        denominator = self.mask_batch_size * self.mask_heads * self.num_query_blocks * self.num_kv_blocks
         return (self.num_partial_tiles + self.num_full_tiles) / denominator
 
     def validate(self) -> None:
         """Validate tensor shapes, devices, dtypes, and schedule bounds."""
         if self.block_size != 32:
             raise ValueError(f"Only block_size=32 is supported, got {self.block_size}.")
-        if self.original_length <= 0 or self.original_length > self.padded_length:
+        if self.query_length <= 0 or self.query_length > self.padded_query_length:
             raise ValueError(
                 "Expected 0 < original_length <= padded_length, got "
-                f"{self.original_length} and {self.padded_length}."
+                f"{self.query_length} and {self.padded_query_length}."
             )
-        if self.padded_length % self.block_size:
-            raise ValueError("padded_length must be divisible by block_size.")
+        if self.kv_length <= 0 or self.kv_length > self.padded_key_value_length:
+            raise ValueError(
+                "Expected 0 < original_kv_length <= padded_kv_length, got "
+                f"{self.kv_length} and {self.padded_key_value_length}."
+            )
+        if self.padded_query_length % self.block_size or self.padded_key_value_length % self.block_size:
+            raise ValueError("Padded query and key/value lengths must be divisible by block_size.")
         if self.partial_kv_num_blocks.ndim != 3:
             raise ValueError("Sparse count tensors must have rank 3.")
         if self.mask_batch_size == 0 or self.mask_heads == 0:
@@ -377,37 +416,41 @@ class BlockSparseMask:
         if any(not getattr(self, name).is_contiguous() for name in _TENSOR_FIELDS):
             raise ValueError("All BlockSparseMask tensors must be contiguous.")
 
-        base_shape = (
+        query_shape = (
             self.mask_batch_size,
             self.mask_heads,
-            self.num_blocks,
+            self.num_query_blocks,
         )
-        for name in (
-            "partial_kv_num_blocks",
-            "full_kv_num_blocks",
-            "partial_q_num_blocks",
-            "full_q_num_blocks",
+        kv_shape = (
+            self.mask_batch_size,
+            self.mask_heads,
+            self.num_kv_blocks,
+        )
+        for name, expected_shape in (
+            ("partial_kv_num_blocks", query_shape),
+            ("full_kv_num_blocks", query_shape),
+            ("partial_q_num_blocks", kv_shape),
+            ("full_q_num_blocks", kv_shape),
         ):
             tensor = getattr(self, name)
-            if tensor.dtype != torch.int32 or tensor.shape != base_shape:
+            if tensor.dtype != torch.int32 or tensor.shape != expected_shape:
                 raise ValueError(
-                    f"{name} must be int32 with shape {base_shape}, "
-                    f"got {tensor.dtype} {tuple(tensor.shape)}."
+                    f"{name} must be int32 with shape {expected_shape}, got {tensor.dtype} {tuple(tensor.shape)}."
                 )
 
-        for name in (
-            "partial_kv_indices",
-            "partial_kv_mask_ids",
-            "full_kv_indices",
-            "partial_q_indices",
-            "partial_q_mask_ids",
-            "full_q_indices",
+        for name, expected_prefix in (
+            ("partial_kv_indices", query_shape),
+            ("partial_kv_mask_ids", query_shape),
+            ("full_kv_indices", query_shape),
+            ("partial_q_indices", kv_shape),
+            ("partial_q_mask_ids", kv_shape),
+            ("full_q_indices", kv_shape),
         ):
             tensor = getattr(self, name)
-            if tensor.dtype != torch.int32 or tensor.shape[:3] != base_shape or tensor.ndim != 4:
+            if tensor.dtype != torch.int32 or tensor.shape[:3] != expected_prefix or tensor.ndim != 4:
                 raise ValueError(
-                    f"{name} must be a rank-4 int32 schedule beginning with {base_shape}, "
-                    f"got {tensor.dtype} {tuple(tensor.shape)}."
+                    f"{name} must be a rank-4 int32 schedule beginning with "
+                    f"{expected_prefix}, got {tensor.dtype} {tuple(tensor.shape)}."
                 )
 
         if (
@@ -431,6 +474,8 @@ class BlockSparseMask:
             indices_name: str,
             mask_ids_name: str | None = None,
             *,
+            row_blocks: int,
+            column_blocks: int,
             transposed: bool = False,
         ) -> set[tuple[int, int, int, int, int | None]]:
             counts = host[counts_name]
@@ -440,19 +485,15 @@ class BlockSparseMask:
             for batch, head, row in product(
                 range(self.mask_batch_size),
                 range(self.mask_heads),
-                range(self.num_blocks),
+                range(row_blocks),
             ):
                 count = int(counts[batch, head, row])
-                if not 0 <= count <= indices.shape[-1] or (
-                    mask_ids is not None and count > mask_ids.shape[-1]
-                ):
+                if not 0 <= count <= indices.shape[-1] or (mask_ids is not None and count > mask_ids.shape[-1]):
                     raise ValueError("Sparse schedule count exceeds its allocated row width.")
-                active_indices = [
-                    int(index) for index in indices[batch, head, row, :count].tolist()
-                ]
+                active_indices = [int(index) for index in indices[batch, head, row, :count].tolist()]
                 if len(active_indices) != len(set(active_indices)):
                     raise ValueError(f"{name} contains a duplicate tile in row {row}.")
-                if any(not 0 <= index < self.num_blocks for index in active_indices):
+                if any(not 0 <= index < column_blocks for index in active_indices):
                     raise ValueError(f"{name} contains an out-of-bounds tile index.")
 
                 active_mask_ids = (
@@ -470,21 +511,36 @@ class BlockSparseMask:
                     edges.add((batch, head, query, key, mask_id))
             return edges
 
-        forward_full = schedule_edges("full_kv", "full_kv_num_blocks", "full_kv_indices")
+        forward_full = schedule_edges(
+            "full_kv",
+            "full_kv_num_blocks",
+            "full_kv_indices",
+            row_blocks=self.num_query_blocks,
+            column_blocks=self.num_kv_blocks,
+        )
         transpose_full = schedule_edges(
-            "full_q", "full_q_num_blocks", "full_q_indices", transposed=True
+            "full_q",
+            "full_q_num_blocks",
+            "full_q_indices",
+            row_blocks=self.num_kv_blocks,
+            column_blocks=self.num_query_blocks,
+            transposed=True,
         )
         forward_partial = schedule_edges(
             "partial_kv",
             "partial_kv_num_blocks",
             "partial_kv_indices",
             "partial_kv_mask_ids",
+            row_blocks=self.num_query_blocks,
+            column_blocks=self.num_kv_blocks,
         )
         transpose_partial = schedule_edges(
             "partial_q",
             "partial_q_num_blocks",
             "partial_q_indices",
             "partial_q_mask_ids",
+            row_blocks=self.num_kv_blocks,
+            column_blocks=self.num_query_blocks,
             transposed=True,
         )
 
@@ -504,9 +560,7 @@ class BlockSparseMask:
             for mask_id in expected_ids:
                 payload = host["partial_masks"][mask_id]
                 if not bool(payload.any()) or bool(payload.all()):
-                    raise ValueError(
-                        "Each scheduled partial payload must be nonempty and not full."
-                    )
+                    raise ValueError("Each scheduled partial payload must be nonempty and not full.")
         if self.partial_masks.shape[0] < max(1, len(forward_mask_ids)):
             raise ValueError("Partial mask storage does not cover every scheduled mask ID.")
         inactive_payloads = host["partial_masks"][len(forward_mask_ids) :]
@@ -514,7 +568,7 @@ class BlockSparseMask:
             raise ValueError("Inactive partial mask payloads must be zero.")
 
         row_has_key = torch.zeros(
-            (self.mask_batch_size, self.mask_heads, self.padded_length),
+            (self.mask_batch_size, self.mask_heads, self.padded_query_length),
             dtype=torch.bool,
         )
         offsets = torch.arange(self.block_size)
@@ -522,16 +576,17 @@ class BlockSparseMask:
         def padding_allowed(query_block: int, key_block: int) -> Tensor:
             query_positions = query_block * self.block_size + offsets[:, None]
             key_positions = key_block * self.block_size + offsets[None, :]
-            return (
-                (query_positions < self.original_length) & (key_positions < self.original_length)
-            ) | ((query_positions >= self.original_length) & (query_positions == key_positions))
+            real = (query_positions < self.query_length) & (key_positions < self.kv_length)
+            if self.query_length == self.kv_length:
+                padding = (query_positions >= self.query_length) & (query_positions == key_positions)
+            else:
+                padding = (query_positions >= self.query_length) & (key_positions == 0)
+            return real | padding
 
         for batch, head, query_block, key_block, _ in forward_full:
             query_start = query_block * self.block_size
             if not bool(padding_allowed(query_block, key_block).all()):
-                raise ValueError(
-                    "Full tiles must not expose padded keys or non-diagonal padded rows."
-                )
+                raise ValueError("Full tiles must not expose padded keys or non-diagonal padded rows.")
             row_has_key[
                 batch,
                 head,
@@ -543,9 +598,7 @@ class BlockSparseMask:
             payload = host["partial_masks"][mask_id]
             query_start = query_block * self.block_size
             if bool((payload & ~padding_allowed(query_block, key_block)).any()):
-                raise ValueError(
-                    "Partial tiles must not expose padded keys or non-diagonal padded rows."
-                )
+                raise ValueError("Partial tiles must not expose padded keys or non-diagonal padded rows.")
             row_has_key[
                 batch,
                 head,
@@ -559,10 +612,7 @@ class BlockSparseMask:
         """Move all mask metadata tensors to ``device``."""
         return replace(
             self,
-            **{
-                name: getattr(self, name).to(device=device, non_blocking=non_blocking)
-                for name in _TENSOR_FIELDS
-            },
+            **{name: getattr(self, name).to(device=device, non_blocking=non_blocking) for name in _TENSOR_FIELDS},
         )
 
     def to_dense(self, *, padded: bool = False) -> Tensor:
@@ -573,8 +623,8 @@ class BlockSparseMask:
             (
                 self.mask_batch_size,
                 self.mask_heads,
-                self.padded_length,
-                self.padded_length,
+                self.padded_query_length,
+                self.padded_key_value_length,
             ),
             dtype=torch.bool,
             device=self.device,
@@ -582,60 +632,60 @@ class BlockSparseMask:
         block = self.block_size
         for batch_idx in range(self.mask_batch_size):
             for head_idx in range(self.mask_heads):
-                for query_block in range(self.num_blocks):
+                for query_block in range(self.num_query_blocks):
                     q_slice = slice(query_block * block, (query_block + 1) * block)
-                    full_count = int(
-                        self.full_kv_num_blocks[batch_idx, head_idx, query_block].item()
-                    )
+                    full_count = int(self.full_kv_num_blocks[batch_idx, head_idx, query_block].item())
                     for entry_idx in range(full_count):
-                        kv_block = int(
-                            self.full_kv_indices[
-                                batch_idx, head_idx, query_block, entry_idx
-                            ].item()
-                        )
+                        kv_block = int(self.full_kv_indices[batch_idx, head_idx, query_block, entry_idx].item())
                         k_slice = slice(kv_block * block, (kv_block + 1) * block)
                         dense[batch_idx, head_idx, q_slice, k_slice] = True
 
-                    partial_count = int(
-                        self.partial_kv_num_blocks[batch_idx, head_idx, query_block].item()
-                    )
+                    partial_count = int(self.partial_kv_num_blocks[batch_idx, head_idx, query_block].item())
                     for entry_idx in range(partial_count):
-                        kv_block = int(
-                            self.partial_kv_indices[
-                                batch_idx, head_idx, query_block, entry_idx
-                            ].item()
-                        )
-                        mask_id = int(
-                            self.partial_kv_mask_ids[
-                                batch_idx, head_idx, query_block, entry_idx
-                            ].item()
-                        )
+                        kv_block = int(self.partial_kv_indices[batch_idx, head_idx, query_block, entry_idx].item())
+                        mask_id = int(self.partial_kv_mask_ids[batch_idx, head_idx, query_block, entry_idx].item())
                         k_slice = slice(kv_block * block, (kv_block + 1) * block)
                         dense[batch_idx, head_idx, q_slice, k_slice] = self.partial_masks[mask_id]
         if padded:
             return dense
-        return dense[..., : self.original_length, : self.original_length]
+        return dense[..., : self.query_length, : self.kv_length]
 
 
-def _flatten_mask(mask: BlockSparseMask) -> tuple[list[Tensor], tuple[int, int, int]]:
+def _flatten_mask(
+    mask: BlockSparseMask,
+) -> tuple[list[Tensor], tuple[int, int, int, int, int]]:
     """Flatten a mask into tensor leaves plus immutable scalar context."""
     return (
         mask._tensor_values(),
-        (mask.original_length, mask.padded_length, mask.block_size),
+        (
+            mask.query_length,
+            mask.padded_query_length,
+            mask.block_size,
+            mask.kv_length,
+            mask.padded_key_value_length,
+        ),
     )
 
 
 def _unflatten_mask(
     tensors: list[Tensor],
-    context: tuple[int, int, int],
+    context: tuple[int, int, int, int, int],
 ) -> BlockSparseMask:
     """Rebuild a mask from pytree tensor leaves and scalar context."""
-    original_length, padded_length, block_size = context
+    (
+        original_length,
+        padded_length,
+        block_size,
+        original_kv_length,
+        padded_kv_length,
+    ) = context
     return BlockSparseMask._from_tensor_values(
         original_length,
         padded_length,
         block_size,
         tensors,
+        original_kv_length,
+        padded_kv_length,
     )
 
 

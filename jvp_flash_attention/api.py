@@ -46,9 +46,7 @@ def _coerce_implementation(
         return AttentionImplementation(implementation)
     except ValueError as error:
         choices = ", ".join(item.value for item in AttentionImplementation)
-        raise ValueError(
-            f"Unknown attention implementation {implementation!r}; expected one of {choices}."
-        ) from error
+        raise ValueError(f"Unknown attention implementation {implementation!r}; expected one of {choices}.") from error
 
 
 def _has_forward_ad_tangent(*tensors: Tensor) -> bool:
@@ -65,38 +63,34 @@ def _validate_implementation(
 ) -> None:
     if implementation.is_block_sparse:
         if not isinstance(block_mask, BlockSparseMask):
-            raise TypeError(
-                f"{implementation.value} requires a BlockSparseMask, "
-                f"got {type(block_mask).__name__}."
-            )
+            raise TypeError(f"{implementation.value} requires a BlockSparseMask, got {type(block_mask).__name__}.")
         if attn_mask is not None:
             raise ValueError(f"{implementation.value} does not accept attn_mask.")
         if causal:
-            raise ValueError(
-                f"{implementation.value} expresses causality through block_mask, "
-                "not causal=True."
-            )
+            raise ValueError(f"{implementation.value} expresses causality through block_mask, not causal=True.")
     elif block_mask is not None:
         raise ValueError(f"{implementation.value} does not accept block_mask.")
     if q.device.type != "cuda":
-        raise RuntimeError(
-            f"{implementation.value} requires a CUDA or ROCm device, got {q.device}."
-        )
+        raise RuntimeError(f"{implementation.value} requires a CUDA or ROCm device, got {q.device}.")
     if implementation is AttentionImplementation.DENSE_TMA:
         if q.ndim == 4 and k.ndim == 4 and q.shape[2] != k.shape[2]:
             raise ValueError("dense_tma supports only square attention.")
         if q.ndim == 4 and q.shape[-1] < 32:
             raise ValueError("dense_tma requires a head dimension of at least 32.")
         if _is_compiling():
-            raise RuntimeError(
-                "dense_tma is not supported under torch.compile; use dense_pointer."
-            )
+            raise RuntimeError("dense_tma is not supported under torch.compile; use dense_pointer.")
         if not supports_tma():
             raise RuntimeError("dense_tma is unavailable on the current device.")
     elif (
         implementation is AttentionImplementation.BLOCK_SPARSE_TMA
-        and not supports_sparse_tma(q.device)
+        and q.ndim == 4
+        and k.ndim == 4
+        and q.shape[2] != k.shape[2]
     ):
+        raise ValueError(
+            "block_sparse_tma supports only square attention; use block_sparse_pointer for rectangular attention."
+        )
+    elif implementation is AttentionImplementation.BLOCK_SPARSE_TMA and not supports_sparse_tma(q.device):
         raise RuntimeError(f"block_sparse_tma is unavailable on {q.device}.")
 
 

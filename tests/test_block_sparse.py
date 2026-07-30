@@ -72,6 +72,28 @@ def test_from_bool_round_trip_and_padding() -> None:
     assert block_mask.num_partial_tiles == 2
 
 
+def test_rectangular_mask_round_trip_and_padding() -> None:
+    query_length, key_value_length = 45, 70
+    mask = torch.zeros(query_length, key_value_length, dtype=torch.bool)
+    mask[:, :32] = True
+    mask[16:, 48:64] = True
+
+    block_mask = BlockSparseMask.from_bool(mask)
+
+    assert block_mask.query_length == query_length
+    assert block_mask.kv_length == key_value_length
+    assert block_mask.padded_query_length == 64
+    assert block_mask.padded_key_value_length == 96
+    assert block_mask.num_query_blocks == 2
+    assert block_mask.num_kv_blocks == 3
+    assert torch.equal(block_mask.to_dense()[0, 0], mask)
+
+    padded = block_mask.to_dense(padded=True)[0, 0]
+    assert not padded[:query_length, key_value_length:].any()
+    assert padded[query_length:, 0].all()
+    assert padded[query_length:, 1:].sum() == 0
+
+
 def test_batch_and_head_specific_round_trip() -> None:
     mask = torch.zeros(2, 3, 64, 64, dtype=torch.bool)
     for batch in range(2):
@@ -128,8 +150,7 @@ def test_pad_to_capacity_stabilizes_tensor_shapes_across_masks() -> None:
     )
 
     tensor_shapes = tuple(
-        tuple(tensor.shape for tensor in torch.utils._pytree.tree_leaves(block_mask))
-        for block_mask in padded_masks
+        tuple(tensor.shape for tensor in torch.utils._pytree.tree_leaves(block_mask)) for block_mask in padded_masks
     )
     assert tensor_shapes[0] == tensor_shapes[1]
     for dense, block_mask in zip(dense_masks, padded_masks, strict=True):
@@ -214,8 +235,7 @@ def test_construction_is_deterministic_and_schedules_are_transposes() -> None:
         partial_ids = first.partial_kv_mask_ids[0, 0, row, :partial_count].tolist()
         assert len(partial_indices) == len(set(partial_indices))
         forward_partial.update(
-            (row, int(column), int(mask_id))
-            for column, mask_id in zip(partial_indices, partial_ids, strict=True)
+            (row, int(column), int(mask_id)) for column, mask_id in zip(partial_indices, partial_ids, strict=True)
         )
 
         full_count = int(first.full_q_num_blocks[0, 0, row])
@@ -228,8 +248,7 @@ def test_construction_is_deterministic_and_schedules_are_transposes() -> None:
         partial_ids = first.partial_q_mask_ids[0, 0, row, :partial_count].tolist()
         assert len(partial_indices) == len(set(partial_indices))
         transpose_partial.update(
-            (int(query), row, int(mask_id))
-            for query, mask_id in zip(partial_indices, partial_ids, strict=True)
+            (int(query), row, int(mask_id)) for query, mask_id in zip(partial_indices, partial_ids, strict=True)
         )
 
     assert forward_full == transpose_full
@@ -246,7 +265,6 @@ def test_construction_is_deterministic_and_schedules_are_transposes() -> None:
     ("mask", "error"),
     [
         (torch.ones(4, 4), TypeError),
-        (torch.ones(3, 4, dtype=torch.bool), ValueError),
         (torch.zeros(4, 4, dtype=torch.bool), ValueError),
         (torch.ones(1, 1, 1, dtype=torch.bool), ValueError),
         (torch.ones(0, 1, 4, 4, dtype=torch.bool), ValueError),
@@ -349,9 +367,7 @@ def test_realistic_pmf_matrix_exact_statistics(
     full_tiles: int,
     partial_tiles: int,
 ) -> None:
-    fixture = make_pmf_mask_from_config(
-        PMFMaskConfig(mode=mode, register_tokens_per_block=registers)
-    )
+    fixture = make_pmf_mask_from_config(PMFMaskConfig(mode=mode, register_tokens_per_block=registers))
     block_mask = BlockSparseMask.from_bool(fixture.mask)
 
     assert fixture.sequence_length == sequence
