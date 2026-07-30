@@ -7,7 +7,13 @@ import torch
 import torch.autograd.forward_ad as fw_ad
 from torch import Tensor
 
-from jvp_flash_attention import BlockSparseMask, JVPAttn
+from jvp_flash_attention import (
+    AttentionImplementation,
+    BlockSparseMask,
+    JVPAttn,
+    flash_attention,
+)
+from jvp_flash_attention.sparse_attention import supports_sparse_tma
 from tests.jit_sandbox_masks import make_pmf_mask
 
 pytestmark = [
@@ -70,19 +76,26 @@ def test_sparse_primal_jvp_and_backward(use_tma: bool) -> None:
     block_mask = BlockSparseMask.from_bool(mask)
     q, k, v, tangent_q, tangent_k, tangent_v = _inputs()
     scale = 0.2
+    if use_tma and not supports_sparse_tma(q.device):
+        pytest.skip("The explicit block_sparse_tma implementation is unavailable")
+    implementation = (
+        AttentionImplementation.BLOCK_SPARSE_TMA
+        if use_tma
+        else AttentionImplementation.BLOCK_SPARSE_POINTER
+    )
 
     q.requires_grad_()
     k.requires_grad_()
     v.requires_grad_()
 
     def sparse(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
-        return JVPAttn.fwd_dual(
+        return flash_attention(
             a,
             b,
             c,
+            implementation=implementation,
             block_mask=block_mask,
             sm_scale=scale,
-            USE_TMA=use_tma,
         )
 
     primal, tangent = torch.func.jvp(

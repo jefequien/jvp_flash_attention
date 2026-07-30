@@ -5,7 +5,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from jvp_flash_attention import BlockSparseMask
+from jvp_flash_attention import (
+    AttentionImplementation,
+    BlockSparseMask,
+    flash_attention,
+)
 from tests.jit_sandbox_masks import PMFMaskConfig, make_pmf_mask_from_config
 
 
@@ -110,6 +114,28 @@ def test_pad_to_capacity_preserves_mask_and_validates() -> None:
     assert torch.equal(padded.to_dense(), dense[None, None])
 
 
+def test_pad_to_capacity_stabilizes_tensor_shapes_across_masks() -> None:
+    dense_masks = (
+        _mask_patterns()["all_full"],
+        _mask_patterns()["one_partial"],
+    )
+    padded_masks = tuple(
+        BlockSparseMask.from_bool(dense).pad_to_capacity(
+            schedule_width=2,
+            partial_mask_count=2,
+        )
+        for dense in dense_masks
+    )
+
+    tensor_shapes = tuple(
+        tuple(tensor.shape for tensor in torch.utils._pytree.tree_leaves(block_mask))
+        for block_mask in padded_masks
+    )
+    assert tensor_shapes[0] == tensor_shapes[1]
+    for dense, block_mask in zip(dense_masks, padded_masks, strict=True):
+        assert torch.equal(block_mask.to_dense(), dense[None, None])
+
+
 def test_pad_to_capacity_rejects_small_capacities() -> None:
     block_mask = BlockSparseMask.from_bool(_mask_patterns()["partial_edges"])
 
@@ -122,6 +148,27 @@ def test_pad_to_capacity_rejects_small_capacities() -> None:
         block_mask.pad_to_capacity(
             schedule_width=block_mask.num_blocks,
             partial_mask_count=0,
+        )
+
+
+def test_public_implementation_requires_matching_mask_kind() -> None:
+    q = torch.empty(1, 1, 32, 16)
+    block_mask = BlockSparseMask.from_bool(torch.eye(32, dtype=torch.bool))
+
+    with pytest.raises(ValueError, match="does not accept block_mask"):
+        flash_attention(
+            q,
+            q,
+            q,
+            implementation=AttentionImplementation.DENSE_POINTER,
+            block_mask=block_mask,
+        )
+    with pytest.raises(ValueError, match="requires block_mask"):
+        flash_attention(
+            q,
+            q,
+            q,
+            implementation=AttentionImplementation.BLOCK_SPARSE_POINTER,
         )
 
 

@@ -45,7 +45,7 @@ Once installed, one can use `jvp_flash_attention` in place of PyTorch's `scaled_
 import torch.nn.functional as F
 
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from jvp_flash_attention.jvp_attention import JVPAttn, attention as jvp_attention
+from jvp_flash_attention import AttentionImplementation, flash_attention
 
 with sdpa_kernel(SDPBackend.MATH):
   # Regular (quadratic) attention
@@ -58,20 +58,33 @@ with sdpa_kernel(SDPBackend.MATH):
   )
 
 # JVP flash attention
-x = jvp_attention(
+x = flash_attention(
     q,
     k,
     v,
+    implementation=AttentionImplementation.DENSE_POINTER,
     attn_mask=attn_mask,
     # dropout_p=attn_dropout_p if self.training else 0.0,  # NOTE: Attention dropout is currently unsupported
 )
 ```
 
-Anecdotally, one can also swap out `F.scaled_dot_product_attention` with `jvp_attention` **even for pretrained models** with minimal impact on numerical accuracy.
+Anecdotally, one can also swap out `F.scaled_dot_product_attention` with
+`flash_attention` **even for pretrained models** with minimal impact on
+numerical accuracy.
 
-> Note: If calling `torch.func.jvp` manually in your model's forward pass like
-> `pred, df = torch.func.jvp(*(lambda x_jvp: model(x_jvp), (x,), (gt,)))`,
-> make sure to use JVP Flash Attention in your model as `model = lambda q, k, v: JVPAttn.fwd_dual(q, k, v)` instead of as `model = lambda q, k, v: jvp_attention(q, k, v)` to ensure each input's tangent vectors are computed [prior](https://github.com/amorehead/jvp_flash_attention/issues/10) to running PyTorch's `autograd` engine. Models that rely on `torch.autograd.grad` to compute higher-order derivatives in their forward pass (e.g., energy-based models) should not require this change.
+The implementation is always explicit and strict:
+
+| Implementation | Mask/layout | Availability |
+| --- | --- | --- |
+| `DENSE_POINTER` | Dense square or supported rectangular attention | Eager and `torch.compile`; partial tangents supported |
+| `DENSE_TMA` | Dense square attention with head dimension at least 32 | TMA-capable GPUs in eager mode |
+| `BLOCK_SPARSE_POINTER` | Square attention with `BlockSparseMask` | Eager and `torch.compile` |
+| `BLOCK_SPARSE_TMA` | Square attention with `BlockSparseMask` | TMA-capable GPUs in eager and compiled modes |
+
+`flash_attention` never substitutes one implementation for another. Unsupported
+requests raise an error naming the required implementation. The lower-level
+`JVPAttn` methods and the historical `attention` alias remain available for
+compatibility.
 
 ### Block-sparse Boolean masks
 
@@ -82,14 +95,24 @@ the model hot path:
 ```python
 import torch
 
-from jvp_flash_attention import BlockSparseMask, JVPAttn
+from jvp_flash_attention import (
+    AttentionImplementation,
+    BlockSparseMask,
+    flash_attention,
+)
 
 # True means visible. A shared [N, N] mask avoids a [B, H, N, N] expansion.
 boolean_mask = torch.ones(sequence, sequence, dtype=torch.bool, device="cuda").tril()
 block_mask = BlockSparseMask.from_bool(boolean_mask)
 
 def attention(q, k, v):
-    return JVPAttn.fwd_dual(q, k, v, block_mask=block_mask)
+    return flash_attention(
+        q,
+        k,
+        v,
+        implementation=AttentionImplementation.BLOCK_SPARSE_TMA,
+        block_mask=block_mask,
+    )
 
 primal, tangent = torch.func.jvp(attention, (q, k, v), (dq, dk, dv))
 ```
@@ -101,10 +124,10 @@ and outputs are sliced back to `N`. Every real query row must expose at least
 one key.
 
 The same API supports direct forward-AD dual tensors, `torch.func.jvp`,
-ordinary reverse-mode dQ/dK/dV, and `torch.compile`. Both TMA
-(`USE_TMA=True`) and pointer-based (`USE_TMA=False`) sparse forward paths are
-available. Move cached metadata with `block_mask.to(device)` and use
-`block_mask.to_dense()` only for debugging.
+ordinary reverse-mode dQ/dK/dV, and `torch.compile`. Select
+`BLOCK_SPARSE_TMA` or `BLOCK_SPARSE_POINTER` explicitly. Move cached metadata
+with `block_mask.to(device)` and use `block_mask.to_dense()` only for
+debugging.
 
 Compiled reverse mode is defined for the primal output only. The compiled
 tangent output is intentionally non-differentiable; detach it before including
@@ -112,9 +135,11 @@ it in a loss, as in the pixel mean-flow training path. Reverse mode through the
 tangent itself is not part of the block-sparse contract.
 
 The initial sparse path is for square self-attention with Boolean masks. It
-does not support sparse additive biases, cross-attention, or attention
-dropout. Supported dtypes are float16, bfloat16, and float32; supported head
-dimensions are 16, 32, 64, 128, and 256.
+does not support sparse additive biases, cross-attention, or attention dropout.
+The dense pointer path also supports unmasked, noncausal rectangular
+cross-attention when both sequence lengths are multiples of 32, including
+query-only JVPs with primal K/V. Supported dtypes are float16, bfloat16, and
+float32; supported head dimensions are 16, 32, 64, 128, and 256.
 
 Contributions or enhancements are welcome!
 
@@ -136,7 +161,8 @@ Model training with either `F.scaled_dot_product_attention` or `JVPAttn.fwd_dual
 
 ### Time scaling
 
-`jvp_attention` outscales the speed of (`SDPBackend.MATH`-based) `F.scaled_dot_product_attention` when calculating second-order derivatives.
+JVP Flash Attention outscales the speed of (`SDPBackend.MATH`-based)
+`F.scaled_dot_product_attention` when calculating second-order derivatives.
 
 <div align="center">
 
@@ -146,7 +172,8 @@ Model training with either `F.scaled_dot_product_attention` or `JVPAttn.fwd_dual
 
 ### Memory scaling
 
-`jvp_attention` improves the memory usage of (`SDPBackend.MATH`-based) `F.scaled_dot_product_attention` when calculating second-order derivatives.
+JVP Flash Attention improves the memory usage of (`SDPBackend.MATH`-based)
+`F.scaled_dot_product_attention` when calculating second-order derivatives.
 
 <div align="center">
 
@@ -572,7 +599,8 @@ Accuracy: 28/28 tests passed
 ✓ All accuracy checks passed!
 ```
 
-Note: Based on these results, for all precision types, it is recommended to provide a boolean `attn_mask` to `jvp_attention()` where possible.
+Note: Based on these results, for all precision types, it is recommended to
+provide a boolean `attn_mask` to `flash_attention()` where possible.
 
 ## License
 
