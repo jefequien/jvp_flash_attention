@@ -163,12 +163,30 @@ def test_public_implementation_requires_matching_mask_kind() -> None:
             implementation=AttentionImplementation.DENSE_POINTER,
             block_mask=block_mask,
         )
-    with pytest.raises(ValueError, match="requires block_mask"):
+    with pytest.raises(TypeError, match="requires a BlockSparseMask"):
         flash_attention(
             q,
             q,
             q,
             implementation=AttentionImplementation.BLOCK_SPARSE_POINTER,
+        )
+    with pytest.raises(ValueError, match="does not accept attn_mask"):
+        flash_attention(
+            q,
+            q,
+            q,
+            implementation=AttentionImplementation.BLOCK_SPARSE_POINTER,
+            attn_mask=torch.eye(32, dtype=torch.bool),
+            block_mask=block_mask,
+        )
+    with pytest.raises(ValueError, match="through block_mask"):
+        flash_attention(
+            q,
+            q,
+            q,
+            implementation=AttentionImplementation.BLOCK_SPARSE_POINTER,
+            block_mask=block_mask,
+            causal=True,
         )
 
 

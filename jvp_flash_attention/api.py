@@ -59,15 +59,25 @@ def _validate_implementation(
     q: Tensor,
     k: Tensor,
     implementation: AttentionImplementation,
+    attn_mask: Tensor | None,
     block_mask: BlockSparseMask | None,
+    causal: bool,
 ) -> None:
-    if implementation.is_block_sparse != (block_mask is not None):
-        requirement = (
-            "requires block_mask"
-            if implementation.is_block_sparse
-            else "does not accept block_mask"
-        )
-        raise ValueError(f"{implementation.value} {requirement}.")
+    if implementation.is_block_sparse:
+        if not isinstance(block_mask, BlockSparseMask):
+            raise TypeError(
+                f"{implementation.value} requires a BlockSparseMask, "
+                f"got {type(block_mask).__name__}."
+            )
+        if attn_mask is not None:
+            raise ValueError(f"{implementation.value} does not accept attn_mask.")
+        if causal:
+            raise ValueError(
+                f"{implementation.value} expresses causality through block_mask, "
+                "not causal=True."
+            )
+    elif block_mask is not None:
+        raise ValueError(f"{implementation.value} does not accept block_mask.")
     if q.device.type != "cuda":
         raise RuntimeError(
             f"{implementation.value} requires a CUDA or ROCm device, got {q.device}."
@@ -111,7 +121,7 @@ def flash_attention(
     tangents when called inside ``torch.func.jvp`` or a dual level.
     """
     selected = _coerce_implementation(implementation)
-    _validate_implementation(q, k, selected, block_mask)
+    _validate_implementation(q, k, selected, attn_mask, block_mask, causal)
     attention_fn = JVPAttn.fwd_dual if _has_forward_ad_tangent(q, k, v) else JVPAttn.fwd
     return attention_fn(
         q,
