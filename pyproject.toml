@@ -24,7 +24,6 @@ classifiers=[
 dependencies = [
     # --------- pytorch --------- #
     "torch>=2.8.0",
-    "torchvision>=0.23",
 
     # --------- others --------- #
     # "numpy>=2.2.6",
@@ -75,12 +74,10 @@ packages = ["jvp_flash_attention"]
 [tool.uv]
 constraint-dependencies = [
     "torch==2.11.0",
-    "torchvision==0.26.0",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
-torchvision = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
